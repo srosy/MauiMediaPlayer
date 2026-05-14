@@ -55,3 +55,32 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# --- MAUI / mobile outputs (supplement to Dotnet.gitignore above) ---
+*.apk
+*.aab
+*.ipa
+*.app
+*.dSYM.zip
+
+# IDE / local tooling (Visual Studio, Rider, Cursor)
+.vs/
+.cursor/
+*.user
+*.userosscache
+*.suo
+*.cache
+*.rsuser
+*.DotSettings.user
+.idea/
+*.sln.iml
+
+# WebView / browser caches (local dev, Windows)
+**/WebView2/
+**/EBWebView/
+
+# Signing / secrets — never commit
+*.pfx
+*.snk
+secrets.json
+appsettings.*.local.json

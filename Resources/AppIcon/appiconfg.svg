@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="456" height="456" viewBox="0 0 456 456" xmlns="http://www.w3.org/2000/svg">
+    <!-- Mosaic foreground glyph: three rounded tiles (one per split pane) with a
+         play triangle in the center tile. White-on-violet renders cleanly at any
+         size from 16px favicons to 1024px launcher icons. -->
+    <g>
+        <rect x="86"  y="153" width="85" height="150" rx="18" ry="18" fill="#FFFFFF" fill-opacity="0.72" />
+        <rect x="186" y="153" width="85" height="150" rx="18" ry="18" fill="#FFFFFF" />
+        <rect x="286" y="153" width="85" height="150" rx="18" ry="18" fill="#FFFFFF" fill-opacity="0.72" />
+        <polygon points="216,200 216,256 254,228" fill="#7C3AED" />
+    </g>
+</svg>

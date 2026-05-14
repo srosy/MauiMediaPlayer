@@ -1,0 +1,141 @@
+@implements IDisposable
+@inject DebugLogService DebugLog
+@inject ToastService Toasts
+
+@* Debug footer. Phase E: collapsed by default into a 32px-tall bar. Clicking
+   the bar (or the chevron icon) expands the log textarea. Copy/Clear actions
+   live in the bar so they're reachable without expanding. *@
+
+<footer class="debug-footer @(_expanded ? "is-expanded" : "is-collapsed")"
+        @onkeydown:stopPropagation="true">
+
+    <div class="debug-footer-bar"
+         role="button"
+         tabindex="0"
+         aria-expanded="@(_expanded ? "true" : "false")"
+         aria-controls="debug-log-body"
+         @onclick="ToggleExpanded"
+         @onkeydown="OnBarKeyDown">
+
+        <Icon Name="@(_expanded ? "chevron-down" : "chevron-up")" Size="12" />
+        <div class="debug-footer-title">Debug log</div>
+        <span class="debug-footer-status" aria-live="polite">@_status</span>
+
+        <div class="debug-footer-actions" @onclick:stopPropagation="true">
+            <button class="icon-btn"
+                    type="button"
+                    style="height:24px;width:24px;"
+                    title="Copy log"
+                    aria-label="Copy log"
+                    @onclick="CopyAsync">
+                <Icon Name="clipboard" Size="12" />
+            </button>
+            <button class="icon-btn"
+                    type="button"
+                    style="height:24px;width:24px;"
+                    title="Clear log"
+                    aria-label="Clear log"
+                    @onclick="DebugLog.Clear">
+                <Icon Name="trash" Size="12" />
+            </button>
+        </div>
+    </div>
+
+    @if (_expanded)
+    {
+        <div id="debug-log-body" class="debug-footer-body">
+            <textarea class="debug-log-text"
+                      readonly
+                      aria-label="Debug log output">@DebugLog.Text</textarea>
+        </div>
+    }
+</footer>
+
+@code {
+    private bool _expanded;
+    private string? _status;
+    private CancellationTokenSource? _statusCts;
+
+    protected override void OnInitialized()
+    {
+        DebugLog.Changed += OnChanged;
+    }
+
+    private void OnChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void ToggleExpanded()
+    {
+        _expanded = !_expanded;
+    }
+
+    private void OnBarKeyDown(KeyboardEventArgs args)
+    {
+        if (args.Key is "Enter" or " ")
+        {
+            ToggleExpanded();
+        }
+    }
+
+    private async Task CopyAsync()
+    {
+        var text = DebugLog.Text;
+
+        // Clipboard.SetTextAsync with null/empty CLEARS the system clipboard per MAUI docs,
+        // so short-circuit and show a friendly toast instead of nuking the user's clipboard.
+        if (string.IsNullOrEmpty(text))
+        {
+            await ShowStatusAsync("Log empty");
+            return;
+        }
+
+        try
+        {
+            await Clipboard.Default.SetTextAsync(text);
+            await ShowStatusAsync("Copied");
+            Toasts.Success("Debug log copied to clipboard.");
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Error($"Debug log copy failed: {ex.Message}");
+            await ShowStatusAsync("Copy failed");
+            Toasts.Error("Could not copy debug log to clipboard.");
+        }
+    }
+
+    private async Task ShowStatusAsync(string status)
+    {
+        _statusCts?.Cancel();
+        _statusCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _statusCts = cts;
+        _status = status;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        if (_statusCts == cts)
+        {
+            _status = null;
+            _statusCts = null;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    public void Dispose()
+    {
+        DebugLog.Changed -= OnChanged;
+        _statusCts?.Cancel();
+        _statusCts?.Dispose();
+        _statusCts = null;
+    }
+}

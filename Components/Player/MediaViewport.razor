@@ -1,0 +1,580 @@
+@implements IAsyncDisposable
+@inject PlaybackService Playback
+@inject PlaylistService Playlist
+@inject MediaSourceService MediaSource
+@inject DebugLogService DebugLog
+@inject NativeVideoPlaybackService NativeVideo
+@inject IJSRuntime JS
+
+@{
+    var visiblePanes = VisiblePanes;
+}
+
+<div class="media-viewport media-split media-split-@visiblePanes.Count @(_isDragOver ? "is-drag-over" : null)"
+     @ondragenter="OnDragEnter"
+     @ondragover:preventDefault="true"
+     @ondragleave="OnDragLeave"
+     @ondrop="OnDrop"
+     @ondrop:preventDefault="true">
+    @if (visiblePanes.Count == 0)
+    {
+        <div class="empty-state">
+            <div class="empty-state-icon">
+                <Icon Name="play-fill" Size="32" />
+            </div>
+            <div class="empty-state-title">Ready when you are</div>
+            <p class="empty-state-text">Add a folder of photos, GIFs, or videos to start a slideshow. Mosaic plays them all and remembers where you left off.</p>
+            <div class="empty-state-actions">
+                <button class="btn btn-primary" type="button" @onclick="RequestAddMedia">
+                    <Icon Name="plus-lg" Size="14" Class="me-1" />
+                    Add media
+                </button>
+            </div>
+            <div class="empty-state-hint">
+                Tip: press <kbd class="shortcut-key">?</kbd> for keyboard shortcuts, or paste paths directly in the Add media dialog.
+            </div>
+        </div>
+    }
+    else
+    {
+        @foreach (var pane in visiblePanes)
+        {
+            @* `is-video-pane` toggles a CSS rule that clips holdover/placeholder
+               HTML so it never bleeds beneath the caption gradient (where the
+               native MediaElement does not paint). See app.css for details. *@
+            <div class="media-pane @(pane.Item.Kind == MediaKind.Video ? "is-video-pane" : null)"
+                 data-media-pane
+                 data-slot="@pane.SlotIndex">
+                @if (pane.Item.Kind == MediaKind.Video)
+                {
+                    @* Phase 5: extend the Phase 4 hold-over treatment to video panes. The
+                       native MediaElement is hidden via reveal-on-Playing (Phase 1) for
+                       ~0.5-1s while the platform opens the new source. Without a hold-over
+                       the user previously saw a "Playing video in app" placeholder during
+                       that window.
+
+                       IMPORTANT: only show the holdover when the IMMEDIATELY PRIOR item
+                       for this slot was an image or gif. On video→video transitions the
+                       stored URI is from BEFORE the previous video — rendering it during
+                       the 1s reveal gap flashes a stale, unrelated image (the original
+                       Phase 5 bug). For those transitions we render the placeholder div
+                       so the user sees the pane's black background until the native video
+                       reveals on top. *@
+                    @* Default to Image when the dictionary has no entry yet (very first
+                       Playback.Changed after cold start, or a slot freshly added by a
+                       split-mode expansion). _lastShownImagePerSlot below is the
+                       secondary filter — it's only populated when an image actually
+                       rendered in this slot, so defaulting to Image safely permits the
+                       holdover ONLY when there's a real image to hold over. Defaulting
+                       to Video would lose the legitimate Phase 5 holdover on the very
+                       first image→video transition (the dictionary is empty for the
+                       first call to UpdateTransitionTrackingPreRender). *@
+                    var prevKind = _previousKindPerSlot.GetValueOrDefault(pane.SlotIndex, MediaKind.Image);
+                    var prevWasImageOrGif = prevKind is MediaKind.Image or MediaKind.Gif;
+                    if (prevWasImageOrGif && _lastShownImagePerSlot.TryGetValue(pane.SlotIndex, out var videoHoldover))
+                    {
+                        <img class="media-image media-image-holdover"
+                             src="@videoHoldover"
+                             alt="@pane.Item.DisplayName"
+                             decoding="async" />
+                    }
+                    else
+                    {
+                        @* No fresh image to hold over (first video of the slot, or a
+                           video→video transition). Render a transparent surface so the
+                           pane shows its own black background — strictly less jarring
+                           than a stale image flash or placeholder text. The MediaElement
+                           reveals on top within ~1s. *@
+                        <div class="native-video-placeholder"></div>
+                    }
+                }
+                else if (pane.Item.Kind is MediaKind.Image or MediaKind.Gif)
+                {
+                    if (_imageErrors.TryGetValue(pane.Item.Id, out var error))
+                    {
+                        <div class="empty-state text-center">
+                            <div class="h4">Could not display image</div>
+                            <p class="mb-0 text-white-50">@error</p>
+                        </div>
+                    }
+                    else if (_imageSources.TryGetValue(pane.Item.Id, out var imageSource))
+                    {
+                        <img class="media-image media-image-ready"
+                             src="@imageSource"
+                             alt="@pane.Item.DisplayName"
+                             decoding="async"
+                             fetchpriority="high" />
+                    }
+                    else if (_lastShownImagePerSlot.TryGetValue(pane.SlotIndex, out var holdover))
+                    {
+                        @* Hold-over: the previous image for THIS slot stays visible while
+                           the new one loads. This eliminates the "Loading image..." flash
+                           that previously appeared on every swap with a cold cache. The
+                           dimmer opacity hints that a transition is in progress without
+                           interrupting the user's view. *@
+                        <img class="media-image media-image-holdover"
+                             src="@holdover"
+                             alt="@pane.Item.DisplayName"
+                             decoding="async" />
+                    }
+                    else
+                    {
+                        @* True cold start (first item for this slot, nothing to hold over). *@
+                        <div class="empty-state text-center">
+                            <div class="h4">Loading image...</div>
+                            <p class="mb-0 text-white-50">@pane.Item.DisplayName</p>
+                        </div>
+                    }
+                }
+                else
+                {
+                    <div class="empty-state text-center">
+                        <div class="h4">Unsupported media</div>
+                        <p class="mb-0 text-white-50">@pane.Item.DisplayName</p>
+                    </div>
+                }
+
+                <div class="media-caption">
+                    <span class="media-caption-title">@pane.Item.DisplayName</span>
+                    <span class="media-caption-actions">
+                        <span class="media-caption-kind">@pane.Item.Kind</span>
+                        <button class="media-skip-btn"
+                                type="button"
+                                title="Skip this pane to the next item"
+                                aria-label="Skip pane"
+                                @onclick="() => SkipSlotAsync(pane.SlotIndex)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="skip-forward-fill" Size="12" />
+                        </button>
+                    </span>
+                </div>
+            </div>
+        }
+    }
+</div>
+
+@code {
+    [Parameter] public EventCallback OnRequestAddMedia { get; set; }
+    [Parameter] public EventCallback<string[]> OnDroppedPaths { get; set; }
+
+    private const int MaxPanes = 3;
+    private readonly Dictionary<Guid, string> _imageSources = [];
+    private readonly Dictionary<Guid, string> _imageErrors = [];
+    private readonly HashSet<Guid> _loadingImageIds = [];
+    // Slot -> last successfully shown data URI. Phase 4 hold-over: when a slot swaps
+    // to a new item whose data URI is not yet ready we render this URI instead of the
+    // "Loading image..." placeholder, so the user sees continuous content.
+    private readonly Dictionary<int, string> _lastShownImagePerSlot = [];
+    // Slot -> the kind of the item this slot was rendering BEFORE the current one.
+    // Used by the video pane markup to suppress the (otherwise stale) holdover during
+    // video→video transitions. Updated in UpdateTransitionTrackingPreRender BEFORE the
+    // re-render fires, so the very first render after a transition already sees the
+    // correct previous kind. Without this, video X→video Y would flash whatever image
+    // was last shown in this slot (potentially minutes old) for ~1s while the
+    // MediaElement opens Y's new source.
+    private readonly Dictionary<int, MediaKind> _previousKindPerSlot = [];
+    private readonly Dictionary<int, Guid> _lastObservedItemIdPerSlot = [];
+    private readonly Dictionary<int, MediaKind> _lastObservedKindPerSlot = [];
+    private DotNetObjectReference<MediaViewport>? _dotNetReference;
+    private bool _isDragOver;
+    // Browsers fire dragenter/dragleave on child elements too. Without a counter,
+    // dragging over any inner element triggers leave -> enter spasms and the drop
+    // indicator flickers. Tracking enter/leave parity gives a stable signal:
+    // indicator is visible iff _dragEnterCount > 0.
+    private int _dragEnterCount;
+
+    private IReadOnlyList<VisibleMediaSlot> VisiblePanes => Playback.VisiblePanes;
+
+    protected override void OnInitialized()
+    {
+        Playback.Changed += OnPlaybackChanged;
+        Playlist.Changed += OnPlaybackChanged;
+    }
+
+    private Task RequestAddMedia() => OnRequestAddMedia.InvokeAsync();
+
+    private void OnDragEnter(DragEventArgs args)
+    {
+        if (!HasFiles(args))
+        {
+            return;
+        }
+
+        _dragEnterCount++;
+
+        if (!_isDragOver)
+        {
+            _isDragOver = true;
+        }
+    }
+
+    // No OnDragOver handler is bound — dragover fires continuously (60+/sec) while
+    // a drag is held; we already know we're hovering from the enter event. Using
+    // only @ondragover:preventDefault="true" attaches a listener for preventDefault
+    // without invoking a C# method, so Blazor never schedules a re-render for them.
+
+    private void OnDragLeave(DragEventArgs args)
+    {
+        _ = args;
+
+        if (_dragEnterCount > 0)
+        {
+            _dragEnterCount--;
+        }
+
+        if (_dragEnterCount == 0 && _isDragOver)
+        {
+            _isDragOver = false;
+        }
+    }
+
+    private async Task OnDrop(DragEventArgs args)
+    {
+        _ = args;
+        _dragEnterCount = 0;
+        _isDragOver = false;
+
+        // The Blazor DragEventArgs surface does not expose file objects directly.
+        // We capture file *names* via JS (WebView2 does not surface OS paths to JS
+        // for security reasons) so the parent can surface a useful diagnostic.
+        try
+        {
+            var paths = await JS.InvokeAsync<string[]>("mauiMediaPlayer.collectDroppedPaths");
+            if (paths is { Length: > 0 })
+            {
+                await OnDroppedPaths.InvokeAsync(paths);
+            }
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Trace($"Drop interop failed: {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
+    private static bool HasFiles(DragEventArgs args)
+    {
+        return args.DataTransfer?.Types?.Any(t => string.Equals(t, "Files", StringComparison.OrdinalIgnoreCase)) == true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _dotNetReference ??= DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("mauiMediaPlayer.observeMediaViewportBounds", _dotNetReference);
+        }
+
+        await UpdateNativeVideoBoundsAsync();
+        await EnsureImageSourcesAsync();
+        UpdateHoldoverState();
+        PruneImageCache();
+    }
+
+    private void UpdateHoldoverState()
+    {
+        // After each render, remember the data URI we showed for each visible slot. The
+        // next time the slot swaps to a NEW item whose URI isn't ready yet, the markup
+        // will render this URI instead of a "Loading image..." flash.
+        foreach (var pane in VisiblePanes)
+        {
+            if (pane.Item.Kind is not (MediaKind.Image or MediaKind.Gif))
+            {
+                continue;
+            }
+
+            if (_imageSources.TryGetValue(pane.Item.Id, out var current))
+            {
+                _lastShownImagePerSlot[pane.SlotIndex] = current;
+            }
+        }
+
+        // Drop holdover entries for slots that are no longer active so we don't keep
+        // stale URIs across a split-mode reduction.
+        var activeSlots = new HashSet<int>();
+        foreach (var pane in VisiblePanes)
+        {
+            activeSlots.Add(pane.SlotIndex);
+        }
+
+        foreach (var slot in _lastShownImagePerSlot.Keys.Where(slot => !activeSlots.Contains(slot)).ToArray())
+        {
+            _lastShownImagePerSlot.Remove(slot);
+        }
+    }
+
+    [JSInvokable]
+    public Task OnMediaDebugEvent(string level, string message)
+    {
+        switch (level.ToUpperInvariant())
+        {
+            case "TRACE":
+                DebugLog.Trace(message);
+                break;
+            case "DEBUG":
+                DebugLog.Debug(message);
+                break;
+            case "ERROR":
+                DebugLog.Error(message);
+                break;
+            default:
+                DebugLog.Info(message);
+                break;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public Task OnMediaPaneBoundsChanged(int slotIndex, double x, double y, double width, double height)
+    {
+        return NativeVideo.SetBoundsAsync(slotIndex, x, y, width, height);
+    }
+
+    private void OnPlaybackChanged()
+    {
+        _ = RefreshAfterPlaybackChangedAsync();
+    }
+
+    private async Task SkipSlotAsync(int slotIndex)
+    {
+        try
+        {
+            await Playback.SkipSlotAsync(slotIndex);
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Error($"Skip failed for slot {slotIndex + 1}: {exception.Message}");
+        }
+    }
+
+    private async Task RefreshAfterPlaybackChangedAsync()
+    {
+        try
+        {
+            await InvokeAsync(() =>
+            {
+                // Capture each slot's "previous kind" BEFORE StateHasChanged schedules
+                // the render. The markup uses _previousKindPerSlot to decide whether a
+                // video pane should show the image holdover (image→video, where the
+                // holdover URI is meaningful) or the placeholder div (video→video,
+                // where the holdover URI is stale). Updating it here — synchronously
+                // before the render — ensures the very first render after a transition
+                // already sees the correct value.
+                UpdateTransitionTrackingPreRender();
+                StateHasChanged();
+            });
+        }
+        catch (Exception exception) when (exception is ObjectDisposedException or InvalidOperationException)
+        {
+            DebugLog.Trace($"Ignored media viewport refresh after disposal: {exception.Message}");
+        }
+    }
+
+    private void UpdateTransitionTrackingPreRender()
+    {
+        foreach (var pane in VisiblePanes)
+        {
+            var lastObservedId = _lastObservedItemIdPerSlot.GetValueOrDefault(pane.SlotIndex);
+
+            // Only record a "previous kind" when the item identity actually changes.
+            // Intermediate re-renders that happen while the slot is still on the SAME
+            // item (e.g. another slot fires Changed) must not clobber the captured
+            // transition info — otherwise the holdover during a long-lasting video
+            // load would briefly flip from "show holdover" to "show placeholder" the
+            // moment any peer slot updates.
+            if (lastObservedId != Guid.Empty && lastObservedId != pane.Item.Id)
+            {
+                // Look up the kind of the item we WERE rendering before this swap.
+                // We can derive it cheaply by remembering only the kind alongside the
+                // id (we don't need the full MediaItem reference).
+                _previousKindPerSlot[pane.SlotIndex] = _lastObservedKindPerSlot.GetValueOrDefault(pane.SlotIndex, MediaKind.Video);
+            }
+
+            _lastObservedItemIdPerSlot[pane.SlotIndex] = pane.Item.Id;
+            _lastObservedKindPerSlot[pane.SlotIndex] = pane.Item.Kind;
+        }
+
+        // Drop tracking for slots that are no longer visible so future split-mode
+        // changes don't carry stale "previous kind" hints across reductions.
+        var activeSlots = new HashSet<int>();
+        foreach (var pane in VisiblePanes)
+        {
+            activeSlots.Add(pane.SlotIndex);
+        }
+
+        foreach (var slot in _previousKindPerSlot.Keys.Where(slot => !activeSlots.Contains(slot)).ToArray())
+        {
+            _previousKindPerSlot.Remove(slot);
+        }
+
+        foreach (var slot in _lastObservedItemIdPerSlot.Keys.Where(slot => !activeSlots.Contains(slot)).ToArray())
+        {
+            _lastObservedItemIdPerSlot.Remove(slot);
+        }
+
+        foreach (var slot in _lastObservedKindPerSlot.Keys.Where(slot => !activeSlots.Contains(slot)).ToArray())
+        {
+            _lastObservedKindPerSlot.Remove(slot);
+        }
+    }
+
+    private async Task EnsureImageSourcesAsync()
+    {
+        foreach (var item in VisiblePanes.Select(static pane => pane.Item).Where(static item => item.Kind is MediaKind.Image or MediaKind.Gif))
+        {
+            if (_imageSources.ContainsKey(item.Id) || _imageErrors.ContainsKey(item.Id) || !_loadingImageIds.Add(item.Id))
+            {
+                continue;
+            }
+
+            DebugLog.Debug($"Preparing {item.Kind} for display: {item.DisplayName}; path={item.FilePath}.");
+
+            _ = LoadImageSourceAsync(item);
+        }
+
+        await Task.CompletedTask;
+    }
+
+    private async Task LoadImageSourceAsync(MediaItem item)
+    {
+        try
+        {
+            var imageSource = await MediaSource.GetImageDataUriAsync(item);
+
+            if (!IsVisibleItem(item.Id))
+            {
+                DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; current panes changed before display.");
+                return;
+            }
+
+            // Phase 4: ask the WebView to decode this URI into its internal image cache
+            // off the main thread BEFORE we attach a real <img> to the DOM. With the
+            // hold-over rendering the previous image during this short window, the user
+            // sees zero "decode hitch" when the <img> swaps in. Best-effort: a failure
+            // or timeout silently proceeds with the attach.
+            await PrewarmInWebViewAsync(imageSource, item.DisplayName);
+
+            if (!IsVisibleItem(item.Id))
+            {
+                DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; pane changed during prewarm.");
+                return;
+            }
+
+            await InvokeAsync(() =>
+            {
+                _imageSources[item.Id] = imageSource;
+                StateHasChanged();
+            });
+            DebugLog.Info($"Image source ready: {item.DisplayName}.");
+        }
+        catch (Exception exception)
+        {
+            if (!IsVisibleItem(item.Id))
+            {
+                DebugLog.Trace($"Discarding stale image error for {item.DisplayName}; current panes changed before error display.");
+                return;
+            }
+
+            await InvokeAsync(() =>
+            {
+                _imageErrors[item.Id] = exception.Message;
+                StateHasChanged();
+            });
+            DebugLog.Error($"Image source failed for {item.DisplayName}: {exception.Message}");
+        }
+        finally
+        {
+            await InvokeAsync(() => _loadingImageIds.Remove(item.Id));
+        }
+    }
+
+    private async Task PrewarmInWebViewAsync(string dataUri, string displayName)
+    {
+        try
+        {
+            var prewarmed = await JS.InvokeAsync<bool>("mauiMediaPlayer.prewarmImage", dataUri, 3000)
+                .AsTask()
+                .WaitAsync(TimeSpan.FromSeconds(3));
+
+            if (!prewarmed)
+            {
+                DebugLog.Trace($"Image prewarm reported failure for {displayName}; proceeding with attach anyway.");
+            }
+        }
+        catch (Exception exception) when (exception is JSDisconnectedException or TimeoutException or TaskCanceledException)
+        {
+            DebugLog.Trace($"Image prewarm skipped for {displayName}: {exception.GetType().Name}.");
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Trace($"Image prewarm faulted for {displayName}: {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
+    private bool IsVisibleItem(Guid itemId)
+    {
+        return VisiblePanes.Any(pane => pane.Item.Id == itemId);
+    }
+
+    private void PruneImageCache()
+    {
+        var visibleIds = VisiblePanes.Select(static pane => pane.Item.Id).ToHashSet();
+
+        foreach (var imageId in _imageSources.Keys.Where(imageId => !visibleIds.Contains(imageId)).ToArray())
+        {
+            _imageSources.Remove(imageId);
+        }
+
+        foreach (var imageId in _imageErrors.Keys.Where(imageId => !visibleIds.Contains(imageId)).ToArray())
+        {
+            _imageErrors.Remove(imageId);
+        }
+    }
+
+    private async Task UpdateNativeVideoBoundsAsync()
+    {
+        try
+        {
+            for (var slotIndex = 0; slotIndex < MaxPanes; slotIndex++)
+            {
+                var bounds = await JS.InvokeAsync<ViewportBounds>("mauiMediaPlayer.getMediaPaneBounds", slotIndex);
+                await NativeVideo.SetBoundsAsync(slotIndex, bounds.X, bounds.Y, bounds.Width, bounds.Height);
+            }
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Trace($"Could not update native video bounds yet: {exception.Message}");
+        }
+    }
+
+    private sealed class ViewportBounds
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("x")]
+        public double X { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("y")]
+        public double Y { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("width")]
+        public double Width { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("height")]
+        public double Height { get; set; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Playback.Changed -= OnPlaybackChanged;
+        Playlist.Changed -= OnPlaybackChanged;
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.disposeMediaViewportBoundsObserver");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+
+        _dotNetReference?.Dispose();
+    }
+}

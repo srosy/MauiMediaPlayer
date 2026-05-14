@@ -1,0 +1,846 @@
+@implements IAsyncDisposable
+@inject MediaLibraryService MediaLibrary
+@inject PlaylistService Playlist
+@inject PlaybackService Playback
+@inject SettingsService SettingsService
+@inject IFullscreenService Fullscreen
+@inject NativeVideoPlaybackService NativeVideo
+@inject DebugLogService DebugLog
+@inject ToastService Toasts
+@inject WindowTitleService WindowTitle
+@inject PopoverStateService Popovers
+@inject IJSRuntime JS
+
+<div class="player-shell @(Fullscreen.IsFullscreen ? "is-fullscreen" : null) @(_compactMode ? "is-compact" : null)"
+     data-player-root
+     tabindex="0"
+     @onkeydown="HandleKeyDown">
+
+    <header class="player-header" @onkeydown:stopPropagation="true">
+        <div class="player-brand" title="@Branding.Tagline">
+            <div class="player-brand-mark">
+                <Icon Name="play-fill" Size="16" />
+            </div>
+            <div class="player-brand-text">
+                <strong>@Branding.AppName</strong>
+                <small>@Branding.Tagline</small>
+            </div>
+        </div>
+
+        <div class="player-header-spacer"></div>
+
+        <div class="player-header-actions">
+            <button class="btn btn-primary btn-sm d-inline-flex align-items-center gap-1"
+                    type="button"
+                    title="Add media (files or folders)"
+                    @onclick="OpenAddMediaDialog">
+                <Icon Name="plus-lg" Size="12" />
+                <span>Add media</span>
+            </button>
+
+            <button class="icon-btn @(IsPlaylistHidden ? null : "is-active")"
+                    type="button"
+                    title="Toggle playlist (L)"
+                    aria-label="Toggle playlist"
+                    @onclick="TogglePlaylistAsync">
+                <Icon Name="list" />
+            </button>
+
+            <button class="icon-btn"
+                    type="button"
+                    title="Keyboard shortcuts (?)"
+                    aria-label="Keyboard shortcuts"
+                    @onclick="OpenShortcuts">
+                <Icon Name="keyboard" />
+            </button>
+
+            <div class="icon-btn-anchor">
+                <button class="icon-btn @(_overflowOpen ? "is-active" : null)"
+                        type="button"
+                        title="More"
+                        aria-label="More"
+                        aria-haspopup="true"
+                        aria-expanded="@(_overflowOpen ? "true" : "false")"
+                        @onclick="ToggleOverflow">
+                    <Icon Name="three-dots-vertical" />
+                </button>
+
+                @if (_overflowOpen)
+                {
+                    <div class="app-popover app-popover-menu" role="menu"
+                         @onclick:stopPropagation="true">
+                        <button class="menu-item" type="button" role="menuitem" @onclick="ToggleThemeAsync">
+                            <Icon Name="@(_theme == "dark" ? "sun-fill" : "moon-stars-fill")" Size="14" />
+                            <span>@(_theme == "dark" ? "Light mode" : "Dark mode")</span>
+                        </button>
+                        <button class="menu-item" type="button" role="menuitem" @onclick="ToggleCompactAsync">
+                            <Icon Name="@(_compactMode ? "fullscreen-exit" : "fullscreen")" Size="14" />
+                            <span>@(_compactMode ? "Exit compact mode" : "Compact mode")</span>
+                        </button>
+                        <div class="menu-divider"></div>
+                        <button class="menu-item" type="button" role="menuitem" @onclick="OpenShortcuts">
+                            <Icon Name="keyboard" Size="14" />
+                            <span>Keyboard shortcuts</span>
+                            <span class="menu-shortcut">?</span>
+                        </button>
+                        <button class="menu-item" type="button" role="menuitem" @onclick="OpenAbout">
+                            <Icon Name="info-circle" Size="14" />
+                            <span>About @Branding.AppName</span>
+                        </button>
+                        <div class="menu-divider"></div>
+                        <button class="menu-item" type="button" role="menuitem"
+                                @onclick="ClearPlaylistAsync"
+                                disabled="@(!Playlist.HasItems)">
+                            <Icon Name="trash" Size="14" />
+                            <span>Clear playlist</span>
+                        </button>
+                    </div>
+                }
+            </div>
+        </div>
+    </header>
+
+    <section class="player-body @(IsPlaylistHidden ? "playlist-collapsed" : null)">
+        <div class="player-main">
+            <MediaViewport OnRequestAddMedia="OpenAddMediaDialog"
+                           OnDroppedPaths="OnFilesDroppedAsync" />
+            <PlaybackControls />
+        </div>
+
+        <PlaylistPanel @bind-IsCollapsed="_playlistCollapsed"
+                       OnStatusChanged="message => Toasts.Info(message)" />
+    </section>
+
+    <DebugLogFooter />
+
+    <ToastHost />
+
+    @* Routing through explicit IsOpenChanged callbacks (instead of @bind-IsOpen)
+       lets us hook overlay suppression on close — the modal's own Close()/Escape
+       paths fire IsOpenChanged(false), and SyncOverlaySuppressionAsync restores
+       the native MediaElements. *@
+    <KeyboardShortcutsModal IsOpen="_shortcutsOpen" IsOpenChanged="OnShortcutsOpenChanged" />
+    <AboutModal IsOpen="_aboutOpen" IsOpenChanged="OnAboutOpenChanged" />
+
+    @if (_showAddMediaDialog)
+    {
+        @* `fade` omitted on the backdrop — see KeyboardShortcutsModal.razor for the
+           rationale (WebView composites the fade slowly over the native overlay). *@
+        <div class="modal-backdrop show"></div>
+        <div class="modal d-block" tabindex="-1" role="dialog" aria-modal="true" @onkeydown:stopPropagation="true">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h2 class="modal-title h5 d-flex align-items-center gap-2">
+                            <Icon Name="plus-lg" Size="16" />
+                            Add media
+                        </h2>
+                        <button class="btn-close" type="button" aria-label="Close" @onclick="CloseAddMediaDialog"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="text-body-secondary small">
+                            Add files, folders, or paste paths. Folders are scanned for supported media (images, GIFs, videos).
+                        </p>
+
+                        <div class="d-flex flex-wrap gap-2 mb-3">
+                            <button class="btn btn-outline-primary" type="button" @onclick="BrowseFilesForDialogAsync" disabled="@_isLoadingMedia">Browse files</button>
+                            @if (MediaLibrary.SupportsFolderPicking)
+                            {
+                                <button class="btn btn-outline-primary" type="button" @onclick="BrowseFolderForDialogAsync" disabled="@_isLoadingMedia">Browse folder</button>
+                            }
+
+                            <div class="form-check ms-auto align-self-center">
+                                <input id="addMediaRecursive"
+                                       class="form-check-input"
+                                       type="checkbox"
+                                       checked="@Playback.Settings.RecursiveFolderScan"
+                                       @onchange="SetRecursiveAsync" />
+                                <label class="form-check-label" for="addMediaRecursive">Scan folders recursively</label>
+                            </div>
+                        </div>
+
+                        <label class="form-label" for="manualPaths">Files or folders, one path per line</label>
+                        <textarea id="manualPaths"
+                                  class="form-control add-media-paths"
+                                  @bind="_manualPaths"
+                                  @bind:event="oninput"
+                                  placeholder="C:\Media\Videos&#10;C:\Media\image.jpg"></textarea>
+
+                        @if (_pendingPaths.Count > 0)
+                        {
+                            <div class="mt-3">
+                                <div class="fw-semibold small mb-2">Pending paths</div>
+                                <div class="list-group add-media-pending">
+                                    @foreach (var path in _pendingPaths)
+                                    {
+                                        <div class="list-group-item d-flex justify-content-between align-items-center gap-2">
+                                            <span class="text-truncate">@path</span>
+                                            <button class="btn btn-sm btn-outline-danger" type="button" @onclick="() => RemovePendingPath(path)">Remove</button>
+                                        </div>
+                                    }
+                                </div>
+                            </div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-outline-secondary" type="button" @onclick="CloseAddMediaDialog" disabled="@_isLoadingMedia">Cancel</button>
+                        <button class="btn btn-primary" type="button" @onclick="LoadPendingMediaAsync" disabled="@_isLoadingMedia">
+                            @(_isLoadingMedia ? "Loading..." : "Load media")
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    private const int FullscreenCaptionIdleMs = 5000;
+
+    // Persisted UI prefs. Stored under their own Preferences keys so the shell's
+    // chrome state survives restarts independently of playback settings.
+    private const string ThemePrefKey = "ui-theme";
+    private const string PlaylistCollapsedPrefKey = "ui-playlist-collapsed";
+    private const string CompactModePrefKey = "ui-compact-mode";
+
+    private bool _showAddMediaDialog;
+    private bool _isLoadingMedia;
+    private bool _hasAttemptedAutoLoad;
+    private bool _fullscreenIdleTrackerActive;
+    private bool _overflowOpen;
+    private bool _shortcutsOpen;
+    private bool _aboutOpen;
+    private bool _playlistCollapsed;
+    private bool _compactMode;
+    private string _theme = "dark";
+    private string _manualPaths = string.Empty;
+    private readonly List<string> _pendingPaths = [];
+    private DotNetObjectReference<PlayerShell>? _dotNetReference;
+    private string? _lastSignaledNowPlayingTitle;
+
+    private bool IsPlaylistHidden => _playlistCollapsed || _compactMode;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Playlist.Changed += OnStateChanged;
+        Playback.Changed += OnPlaybackChanged;
+        Fullscreen.FullscreenChanged += OnStateChanged;
+        Popovers.CloseRequested += OnPopoversCloseRequested;
+        Popovers.AnyOpenChanged += OnPopoverAnyOpenChanged;
+
+        // UI preferences (theme, collapse, compact) load synchronously and apply
+        // before the first paint so users don't see a flash from the defaults.
+        _theme = Preferences.Default.Get(ThemePrefKey, "dark");
+        _playlistCollapsed = Preferences.Default.Get(PlaylistCollapsedPrefKey, false);
+        _compactMode = Preferences.Default.Get(CompactModePrefKey, false);
+
+        await Playback.InitializeAsync();
+        DebugLog.Add("Application initialized.");
+    }
+
+    private void OnPopoversCloseRequested()
+    {
+        // Another popover (e.g. settings gear) asked the shared bus to close
+        // everything. Drop the overflow menu so the user never has two stacked.
+        if (_overflowOpen)
+        {
+            _overflowOpen = false;
+            // Mirror the state in the popover service so AnyOpen recalculates
+            // (which in turn unsuppresses the native video overlays).
+            Popovers.SetOpen(this, false);
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OnPopoverAnyOpenChanged(bool anyOpen)
+    {
+        // Any popover (settings gear, overflow menu, or anything else that
+        // registers with PopoverStateService) opening or closing should
+        // re-evaluate native video suppression. Fire-and-forget because
+        // event handlers can't be async and the work is brief (a MainThread
+        // marshaled opacity/bounds toggle).
+        _ = anyOpen;
+        _ = SyncOverlaySuppressionAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _dotNetReference = DotNetObjectReference.Create(this);
+            await JS.InvokeVoidAsync("mauiMediaPlayer.registerAppShortcuts", _dotNetReference);
+            await JS.InvokeVoidAsync("mauiMediaPlayer.installDropListener");
+            await JS.InvokeVoidAsync("mauiMediaPlayer.installOutsideClickHandler", _dotNetReference);
+            await JS.InvokeVoidAsync("mauiMediaPlayer.focusPlayerRoot");
+            await ApplyThemeAsync();
+            await AutoLoadLastMediaAsync();
+        }
+
+        // Idle tracker pairs with fullscreen so non-fullscreen renders don't carry
+        // the .is-mouse-active class or document-level input listeners.
+        await SyncFullscreenIdleTrackerAsync();
+    }
+
+    private async Task SyncFullscreenIdleTrackerAsync()
+    {
+        if (Fullscreen.IsFullscreen && !_fullscreenIdleTrackerActive)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.installFullscreenIdleTracker", FullscreenCaptionIdleMs);
+                _fullscreenIdleTrackerActive = true;
+            }
+            catch (Exception exception) when (exception is JSDisconnectedException or InvalidOperationException)
+            {
+                DebugLog.Trace($"Could not install fullscreen idle tracker: {exception.GetType().Name}.");
+            }
+        }
+        else if (!Fullscreen.IsFullscreen && _fullscreenIdleTrackerActive)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.uninstallFullscreenIdleTracker");
+            }
+            catch (Exception exception) when (exception is JSDisconnectedException or InvalidOperationException)
+            {
+                DebugLog.Trace($"Could not uninstall fullscreen idle tracker: {exception.GetType().Name}.");
+            }
+
+            _fullscreenIdleTrackerActive = false;
+        }
+    }
+
+    private async Task ApplyThemeAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.setTheme", _theme);
+        }
+        catch (Exception exception) when (exception is JSDisconnectedException or InvalidOperationException)
+        {
+            DebugLog.Trace($"Could not apply theme: {exception.GetType().Name}.");
+        }
+    }
+
+    private async Task OpenAddMediaDialog()
+    {
+        // Set the modal flag FIRST so the AnyOpenChanged(false) that fires when
+        // CloseAll() unregisters popovers doesn't briefly flip native-video
+        // suppression off — SyncOverlaySuppressionAsync still sees `_showAdd...`
+        // = true and keeps the suppression active across the transition.
+        _showAddMediaDialog = true;
+        _shortcutsOpen = false;
+        _aboutOpen = false;
+        _overflowOpen = false;
+        // Clear our own contribution to the popover-state aggregate before
+        // CloseAll, so an outstanding overflow registration is properly removed.
+        Popovers.SetOpen(this, false);
+        Popovers.CloseAll();
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task CloseAddMediaDialog()
+    {
+        if (_isLoadingMedia)
+        {
+            return;
+        }
+
+        _pendingPaths.Clear();
+        _manualPaths = string.Empty;
+        _showAddMediaDialog = false;
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task BrowseFilesForDialogAsync()
+    {
+        try
+        {
+            var paths = await MediaLibrary.PickFilePathsAsync();
+            AddPendingPaths(paths);
+            DebugLog.Add($"Selected {paths.Count} file path(s) for loading.");
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not browse files: {exception.Message}");
+        }
+    }
+
+    private async Task BrowseFolderForDialogAsync()
+    {
+        try
+        {
+            var folderPath = await MediaLibrary.PickFolderPathAsync();
+
+            if (!string.IsNullOrWhiteSpace(folderPath))
+            {
+                AddPendingPaths([folderPath]);
+                DebugLog.Add($"Selected folder for loading: {folderPath}");
+            }
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not browse folder: {exception.Message}");
+        }
+    }
+
+    private async Task LoadPendingMediaAsync()
+    {
+        if (_isLoadingMedia)
+        {
+            return;
+        }
+
+        var paths = _pendingPaths
+            .Concat(ParseManualPaths())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (paths.Length == 0)
+        {
+            Toasts.Info("Choose files, choose at least one folder, or paste one or more paths before loading.");
+            return;
+        }
+
+        _isLoadingMedia = true;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            DebugLog.Add($"Loading {paths.Length} path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
+            var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
+            var loadedAny = await AddScanResultAsync(result, "media");
+
+            if (loadedAny)
+            {
+                await SettingsService.SaveLastMediaPathsAsync(paths);
+                await SettingsService.AddRecentPathsAsync(paths);
+                _pendingPaths.Clear();
+                _manualPaths = string.Empty;
+                _showAddMediaDialog = false;
+                await SyncOverlaySuppressionAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not load selected media: {exception.Message}");
+        }
+        finally
+        {
+            _isLoadingMedia = false;
+        }
+    }
+
+    private async Task<bool> AddScanResultAsync(MediaScanResult result, string sourceDescription)
+    {
+        if (result.Items.Count > 0)
+        {
+            Playlist.AddItems(result.Items);
+            var skipped = result.SkippedFiles.Count;
+            var skipPart = skipped > 0 ? $" (skipped {skipped} unsupported)" : "";
+            Toasts.Success($"Added {result.Items.Count} item{(result.Items.Count == 1 ? "" : "s")} from {sourceDescription}{skipPart}.");
+            DebugLog.Add($"Added {result.Items.Count} item(s); skipped {skipped}.");
+
+            if (Playback.Status == PlaybackStatus.Stopped)
+            {
+                await Playback.PlayAsync();
+            }
+            else
+            {
+                await Playback.RefreshPlaylistAsync();
+            }
+
+            return true;
+        }
+
+        if (result.SkippedFiles.Count > 0)
+        {
+            Toasts.Info($"No supported media found ({result.SkippedFiles.Count} skipped).");
+        }
+        else
+        {
+            Toasts.Info("No media was selected.");
+        }
+
+        DebugLog.Add($"No media loaded. Skipped {result.SkippedFiles.Count} item(s).");
+        return false;
+    }
+
+    private async Task AutoLoadLastMediaAsync()
+    {
+        if (_hasAttemptedAutoLoad || Playlist.HasItems)
+        {
+            return;
+        }
+
+        _hasAttemptedAutoLoad = true;
+        var paths = (await SettingsService.GetLastMediaPathsAsync())
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (paths.Length == 0)
+        {
+            DebugLog.Debug("No last media location saved for auto-load.");
+            return;
+        }
+
+        _isLoadingMedia = true;
+        Toasts.Info($"Loading last location: {paths[0]}");
+
+        try
+        {
+            DebugLog.Add($"Auto-loading {paths.Length} saved media path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
+            var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
+            await AddScanResultAsync(result, "last known location");
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not auto-load the last media location: {exception.Message}");
+        }
+        finally
+        {
+            _isLoadingMedia = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task ClearPlaylistAsync()
+    {
+        CloseOverflowMenu();
+        await Playback.StopAsync();
+        Playlist.Clear();
+        Toasts.Info("Playlist cleared.");
+        DebugLog.Add("Playlist cleared.");
+    }
+
+    private async Task TogglePlaylistAsync()
+    {
+        _playlistCollapsed = !_playlistCollapsed;
+        Preferences.Default.Set(PlaylistCollapsedPrefKey, _playlistCollapsed);
+        await Task.CompletedTask;
+    }
+
+    private void ToggleOverflow()
+    {
+        if (!_overflowOpen)
+        {
+            // Closing any other popovers (e.g. settings gear) before opening this one
+            // avoids stacked menus.
+            Popovers.CloseAll();
+        }
+
+        _overflowOpen = !_overflowOpen;
+        // Register with the popover service so AnyOpenChanged fires and the shell
+        // suppresses native video overlays while the overflow menu is up.
+        Popovers.SetOpen(this, _overflowOpen);
+    }
+
+    // Closes the overflow menu and keeps the popover service in sync. Use this
+    // anywhere we'd otherwise write `_overflowOpen = false` directly — bare
+    // assignment leaves PopoverStateService thinking the menu is still open,
+    // which prevents AnyOpenChanged from firing and strands native-video
+    // suppression in the "on" state.
+    private void CloseOverflowMenu()
+    {
+        if (_overflowOpen)
+        {
+            _overflowOpen = false;
+        }
+
+        Popovers.SetOpen(this, false);
+    }
+
+    private async Task OpenShortcuts()
+    {
+        // Set the modal flag FIRST so suppression stays asserted across the
+        // popover-close transition (see OpenAddMediaDialog for the rationale).
+        _shortcutsOpen = true;
+        _aboutOpen = false;
+        _showAddMediaDialog = false;
+        _overflowOpen = false;
+        Popovers.SetOpen(this, false);
+        Popovers.CloseAll();
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task OpenAbout()
+    {
+        _aboutOpen = true;
+        _shortcutsOpen = false;
+        _showAddMediaDialog = false;
+        _overflowOpen = false;
+        Popovers.SetOpen(this, false);
+        Popovers.CloseAll();
+        await SyncOverlaySuppressionAsync();
+    }
+
+    // Native MediaElement is rendered as a SwapChainPanel ABOVE the WebView on
+    // Windows, so any HTML modal, popover, or dropdown is painted BEHIND the
+    // video by default. Every overlay open/close should call into here so the
+    // native surfaces are hidden while ANY overlay is up — and only restored
+    // after every overlay is closed. Popovers (gear settings, overflow menu)
+    // are tracked via PopoverStateService.AnyOpen; the three top-level modals
+    // are tracked by their explicit fields here.
+    private Task SyncOverlaySuppressionAsync()
+    {
+        var anyOverlayOpen = _shortcutsOpen
+            || _aboutOpen
+            || _showAddMediaDialog
+            || Popovers.AnyOpen;
+        return NativeVideo.SuppressForOverlayAsync(anyOverlayOpen);
+    }
+
+    private async Task OnShortcutsOpenChanged(bool isOpen)
+    {
+        _shortcutsOpen = isOpen;
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task OnAboutOpenChanged(bool isOpen)
+    {
+        _aboutOpen = isOpen;
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task ToggleThemeAsync()
+    {
+        _theme = _theme == "dark" ? "light" : "dark";
+        Preferences.Default.Set(ThemePrefKey, _theme);
+        CloseOverflowMenu();
+        await ApplyThemeAsync();
+    }
+
+    private async Task ToggleCompactAsync()
+    {
+        _compactMode = !_compactMode;
+        Preferences.Default.Set(CompactModePrefKey, _compactMode);
+        CloseOverflowMenu();
+        await Task.CompletedTask;
+    }
+
+    private Task SetRecursiveAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.RecursiveFolderScan = args.Value is bool enabled && enabled);
+
+    private async Task OnFilesDroppedAsync(string[] fileNames)
+    {
+        // WebView2 / BlazorWebView do not expose dropped file *paths* to JS for
+        // security reasons; we can only see the file *names*. Surface a toast so
+        // the user knows to use Add Media (which uses the native picker that
+        // returns full paths).
+        if (fileNames is null || fileNames.Length == 0)
+        {
+            return;
+        }
+
+        Toasts.Info($"Drag-and-drop shows {fileNames.Length} file(s) but their full paths aren't accessible from the WebView. Use Add Media to add them.");
+        await Task.CompletedTask;
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs args)
+    {
+        switch (args.Key.ToLowerInvariant())
+        {
+            case " ":
+                if (Playback.Status == PlaybackStatus.Playing)
+                {
+                    await Playback.PauseAsync();
+                }
+                else
+                {
+                    await Playback.PlayAsync();
+                }
+                break;
+
+            case "f":
+                if (Fullscreen.IsSupported)
+                {
+                    await Fullscreen.ToggleAsync();
+                }
+                break;
+
+            case "escape":
+                if (_overflowOpen) { _overflowOpen = false; Popovers.CloseAll(); break; }
+                if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); break; }
+                if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); break; }
+                if (_showAddMediaDialog) { await CloseAddMediaDialog(); break; }
+                Popovers.CloseAll();
+                if (Fullscreen.IsSupported)
+                {
+                    await Fullscreen.ExitAsync();
+                }
+                await JS.InvokeVoidAsync("mauiMediaPlayer.focusPlayerRoot");
+                break;
+
+            case "arrowright":
+                await Playback.NextAsync();
+                break;
+
+            case "arrowleft":
+                await Playback.PreviousAsync();
+                break;
+
+            case "m":
+                await Playback.UpdateSettingsAsync(settings => settings.Muted = !settings.Muted);
+                break;
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnAppShortcut(string shortcut)
+    {
+        switch (shortcut)
+        {
+            case "exitFullscreen":
+                // Modals/overlays consume Escape first, so the fullscreen toggle
+                // only fires once they're all closed.
+                if (_overflowOpen) { _overflowOpen = false; Popovers.CloseAll(); await InvokeAsync(StateHasChanged); break; }
+                if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
+                if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
+                if (_showAddMediaDialog) { await CloseAddMediaDialog(); await InvokeAsync(StateHasChanged); break; }
+                Popovers.CloseAll();
+
+                if (Fullscreen.IsSupported)
+                {
+                    await Fullscreen.ExitAsync();
+                }
+                break;
+            case "toggleFullscreen":
+                if (Fullscreen.IsSupported)
+                {
+                    await Fullscreen.ToggleAsync();
+                }
+                break;
+            case "togglePlayback":
+                await TogglePlaybackAsync();
+                break;
+            case "previousFullscreenSingleMode":
+                if (Fullscreen.IsFullscreen && Playback.Settings.SplitScreenMode == SplitScreenMode.Single)
+                {
+                    await Playback.PreviousAsync();
+                }
+                break;
+            case "showShortcuts":
+                await OpenShortcuts();
+                await InvokeAsync(StateHasChanged);
+                break;
+            case "togglePlaylist":
+                await TogglePlaylistAsync();
+                await InvokeAsync(StateHasChanged);
+                break;
+        }
+    }
+
+    [JSInvokable]
+    public Task OnOutsideClick()
+    {
+        // Outside-click closes both the overflow menu and any other popovers
+        // (settings, future) registered with the shared popover service.
+        var hadOverflow = _overflowOpen;
+        _overflowOpen = false;
+        Popovers.CloseAll();
+
+        return hadOverflow ? InvokeAsync(StateHasChanged) : Task.CompletedTask;
+    }
+
+    private Task TogglePlaybackAsync()
+    {
+        return Playback.Status == PlaybackStatus.Playing
+            ? Playback.PauseAsync()
+            : Playback.PlayAsync();
+    }
+
+    private void OnPlaybackChanged()
+    {
+        // Window title reflects the now-playing item ONLY while Playing or Paused.
+        // When Stopped (user pressed Stop, or playback finished with LoopMode.Off
+        // and an empty queue) we clear back to the bare app name so the chrome
+        // doesn't carry stale "Now playing" semantics across sessions.
+        var hasActiveItem = Playback.Status != PlaybackStatus.Stopped;
+        var nowPlayingTitle = hasActiveItem ? Playlist.CurrentItem?.DisplayName : null;
+
+        if (!string.Equals(_lastSignaledNowPlayingTitle, nowPlayingTitle, StringComparison.Ordinal))
+        {
+            _lastSignaledNowPlayingTitle = nowPlayingTitle;
+            WindowTitle.SetNowPlaying(nowPlayingTitle);
+        }
+
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void AddPendingPaths(IEnumerable<string> paths)
+    {
+        foreach (var path in paths.Where(static path => !string.IsNullOrWhiteSpace(path)))
+        {
+            if (!_pendingPaths.Contains(path, StringComparer.OrdinalIgnoreCase))
+            {
+                _pendingPaths.Add(path);
+            }
+        }
+    }
+
+    private void RemovePendingPath(string path)
+    {
+        _pendingPaths.Remove(path);
+    }
+
+    private IEnumerable<string> ParseManualPaths()
+    {
+        return _manualPaths
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(static path => !string.IsNullOrWhiteSpace(path));
+    }
+
+    private void OnStateChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Playlist.Changed -= OnStateChanged;
+        Playback.Changed -= OnPlaybackChanged;
+        Fullscreen.FullscreenChanged -= OnStateChanged;
+        Popovers.CloseRequested -= OnPopoversCloseRequested;
+        Popovers.AnyOpenChanged -= OnPopoverAnyOpenChanged;
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.unregisterAppShortcuts");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.uninstallDropListener");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.uninstallOutsideClickHandler");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+
+        if (_fullscreenIdleTrackerActive)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.uninstallFullscreenIdleTracker");
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+
+            _fullscreenIdleTrackerActive = false;
+        }
+
+        _dotNetReference?.Dispose();
+    }
+}

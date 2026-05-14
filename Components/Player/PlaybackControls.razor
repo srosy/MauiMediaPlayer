@@ -1,0 +1,277 @@
+@implements IDisposable
+@inject PlaybackService Playback
+@inject PlaylistService Playlist
+@inject IFullscreenService Fullscreen
+
+@* Transport bar: a single horizontal strip with three clusters and a
+   full-width progress row above. Layout: playback cluster (left), now-playing
+   (center), behavior + output clusters (right). Rare settings (playback speed,
+   image seconds, GIF repeats, split-screen toggles, recursive scan) live behind
+   the gear popover. Loop mode and split-screen mode are cycled by clicking the
+   icon button (single button per mode for a denser layout). *@
+
+<div class="transport-bar" @onkeydown:stopPropagation="true">
+    <div class="transport-progress">
+        <span class="transport-time">@FormatTime(Playback.VideoPosition)</span>
+        <input class="transport-progress-range"
+               type="range"
+               min="0"
+               max="@Math.Max(1, ProgressMaxSeconds)"
+               step="1"
+               value="@Math.Min(ProgressMaxSeconds, Playback.VideoPosition.TotalSeconds)"
+               @onchange="SeekAsync"
+               disabled="@(!IsSeekable)"
+               aria-label="Playback progress" />
+        <span class="transport-time">@FormatTime(EffectiveDuration)</span>
+    </div>
+
+    <div class="transport-row">
+        <div class="transport-cluster" role="group" aria-label="Playback">
+            <button class="icon-btn"
+                    type="button"
+                    title="Previous (←)"
+                    aria-label="Previous"
+                    @onclick="Playback.PreviousAsync"
+                    disabled="@(!Playlist.HasItems)">
+                <Icon Name="skip-start-fill" />
+            </button>
+
+            @if (Playback.Status == PlaybackStatus.Playing)
+            {
+                <button class="icon-btn is-primary"
+                        type="button"
+                        title="Pause (Space)"
+                        aria-label="Pause"
+                        @onclick="Playback.PauseAsync"
+                        disabled="@(!Playlist.HasItems)">
+                    <Icon Name="pause-fill" Size="20" />
+                </button>
+            }
+            else
+            {
+                <button class="icon-btn is-primary"
+                        type="button"
+                        title="Play (Space)"
+                        aria-label="Play"
+                        @onclick="Playback.PlayAsync"
+                        disabled="@(!Playlist.HasItems)">
+                    <Icon Name="play-fill" Size="20" />
+                </button>
+            }
+
+            <button class="icon-btn"
+                    type="button"
+                    title="Stop"
+                    aria-label="Stop"
+                    @onclick="Playback.StopAsync"
+                    disabled="@(!Playlist.HasItems)">
+                <Icon Name="stop-fill" />
+            </button>
+
+            <button class="icon-btn"
+                    type="button"
+                    title="Next (→)"
+                    aria-label="Next"
+                    @onclick="Playback.NextAsync"
+                    disabled="@(!Playlist.HasItems)">
+                <Icon Name="skip-end-fill" />
+            </button>
+
+            <button class="icon-btn"
+                    type="button"
+                    title="Jump to a random item"
+                    aria-label="Random item"
+                    @onclick="Playback.RandomAsync"
+                    disabled="@(!Playlist.HasItems)">
+                <Icon Name="dice-5-fill" />
+            </button>
+        </div>
+
+        <div class="transport-cluster" role="group" aria-label="Behavior">
+            <button class="icon-btn @(Playback.Settings.Shuffle ? "is-active" : null)"
+                    type="button"
+                    title="Shuffle: @(Playback.Settings.Shuffle ? "on" : "off")"
+                    aria-pressed="@(Playback.Settings.Shuffle ? "true" : "false")"
+                    aria-label="Toggle shuffle"
+                    @onclick="ToggleShuffleAsync">
+                <Icon Name="shuffle" />
+            </button>
+
+            <button class="icon-btn @(Playback.Settings.LoopMode != LoopMode.Off ? "is-active" : null)"
+                    type="button"
+                    title="Loop: @LoopLabel"
+                    aria-label="Cycle loop mode"
+                    @onclick="CycleLoopAsync">
+                <Icon Name="@(Playback.Settings.LoopMode == LoopMode.One ? "repeat-1" : "repeat")" />
+            </button>
+
+            <button class="icon-btn @(Playback.Settings.SplitScreenMode != SplitScreenMode.Single ? "is-active" : null)"
+                    type="button"
+                    title="View: @SplitLabel"
+                    aria-label="Cycle split-screen mode"
+                    @onclick="CycleSplitAsync">
+                <Icon Name="@SplitIcon" />
+            </button>
+        </div>
+
+        <div class="transport-nowplaying" aria-live="polite">
+            <div class="transport-nowplaying-title">@(NowPlayingTitle ?? "No media")</div>
+            <div class="transport-nowplaying-meta">
+                @if (NowPlayingTitle is not null)
+                {
+                    <span>@Playlist.CounterText</span>
+                    <span class="mx-2">&middot;</span>
+                    <span>@(NowPlayingKind?.ToString())</span>
+                }
+                else
+                {
+                    <span>Add files or a folder to begin</span>
+                }
+            </div>
+        </div>
+
+        <div class="transport-cluster" role="group" aria-label="Output">
+            <button class="icon-btn @(Playback.Settings.Muted ? "is-active" : null)"
+                    type="button"
+                    title="@(Playback.Settings.Muted ? "Unmute (M)" : "Mute (M)")"
+                    aria-pressed="@(Playback.Settings.Muted ? "true" : "false")"
+                    aria-label="Toggle mute"
+                    @onclick="ToggleMutedAsync">
+                <Icon Name="@(Playback.Settings.Muted ? "volume-mute-fill" : "volume-up-fill")" />
+            </button>
+
+            <input class="form-range"
+                   type="range"
+                   min="0"
+                   max="1"
+                   step="0.05"
+                   value="@Playback.Settings.Volume"
+                   style="max-width: 90px;"
+                   @onchange="SetVolumeAsync"
+                   aria-label="Volume" />
+
+            <SettingsPopover @bind-IsOpen="_settingsOpen" />
+
+            <button class="icon-btn"
+                    type="button"
+                    title="@(Fullscreen.IsFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)")"
+                    aria-label="Toggle fullscreen"
+                    @onclick="Fullscreen.ToggleAsync"
+                    disabled="@(!Fullscreen.IsSupported)">
+                <Icon Name="@(Fullscreen.IsFullscreen ? "fullscreen-exit" : "fullscreen")" />
+            </button>
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool _settingsOpen;
+
+    protected override void OnInitialized()
+    {
+        Playback.Changed += OnStateChanged;
+        Playlist.Changed += OnStateChanged;
+        Fullscreen.FullscreenChanged += OnStateChanged;
+    }
+
+    private string? NowPlayingTitle => Playlist.CurrentItem?.DisplayName;
+
+    private MediaKind? NowPlayingKind => Playlist.CurrentItem?.Kind;
+
+    // Progress shows real seconds for videos; for images/GIFs we estimate from
+    // the configured timer so the bar still drifts while a slide is on screen.
+    private bool IsSeekable => Playlist.CurrentItem?.Kind == MediaKind.Video;
+
+    private double ProgressMaxSeconds => EffectiveDuration.TotalSeconds > 0
+        ? EffectiveDuration.TotalSeconds
+        : 1;
+
+    private TimeSpan EffectiveDuration => Playback.VideoDuration;
+
+    private string LoopLabel => Playback.Settings.LoopMode switch
+    {
+        LoopMode.Off => "off",
+        LoopMode.One => "one",
+        _ => "all",
+    };
+
+    private string SplitLabel => Playback.Settings.SplitScreenMode switch
+    {
+        SplitScreenMode.Single => "single",
+        SplitScreenMode.BiSplit => "bi-split",
+        _ => "tri-split",
+    };
+
+    private string SplitIcon => Playback.Settings.SplitScreenMode switch
+    {
+        SplitScreenMode.BiSplit => "layout-split",
+        SplitScreenMode.TriSplit => "layout-three-columns",
+        _ => "layout-sidebar",
+    };
+
+    private Task ToggleShuffleAsync() =>
+        Playback.UpdateSettingsAsync(s => s.Shuffle = !s.Shuffle);
+
+    private Task CycleLoopAsync() =>
+        Playback.UpdateSettingsAsync(s => s.LoopMode = NextLoop(s.LoopMode));
+
+    private Task CycleSplitAsync() =>
+        Playback.UpdateSettingsAsync(s => s.SplitScreenMode = NextSplit(s.SplitScreenMode));
+
+    private Task ToggleMutedAsync() =>
+        Playback.UpdateSettingsAsync(s => s.Muted = !s.Muted);
+
+    private Task SetVolumeAsync(ChangeEventArgs args)
+    {
+        return double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var v)
+            ? Playback.UpdateSettingsAsync(s => s.Volume = v)
+            : Task.CompletedTask;
+    }
+
+    private async Task SeekAsync(ChangeEventArgs args)
+    {
+        if (!IsSeekable
+            || !double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+        {
+            return;
+        }
+
+        await Playback.SeekAsync(seconds);
+    }
+
+    private static LoopMode NextLoop(LoopMode current) => current switch
+    {
+        LoopMode.Off => LoopMode.All,
+        LoopMode.All => LoopMode.One,
+        _ => LoopMode.Off,
+    };
+
+    private static SplitScreenMode NextSplit(SplitScreenMode current) => current switch
+    {
+        SplitScreenMode.Single => SplitScreenMode.BiSplit,
+        SplitScreenMode.BiSplit => SplitScreenMode.TriSplit,
+        _ => SplitScreenMode.Single,
+    };
+
+    private static string FormatTime(TimeSpan time)
+    {
+        if (time.TotalSeconds <= 0)
+        {
+            return "0:00";
+        }
+
+        return time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"m\:ss");
+    }
+
+    private void OnStateChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        Playback.Changed -= OnStateChanged;
+        Playlist.Changed -= OnStateChanged;
+        Fullscreen.FullscreenChanged -= OnStateChanged;
+    }
+}

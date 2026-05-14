@@ -1,0 +1,87 @@
+@* Keyboard-shortcut reference, opened via `?` key or overflow menu. Static
+   content — kept in sync manually with PlayerShell.HandleKeyDown and the JS
+   global key handler. *@
+
+@if (IsOpen)
+{
+    @* No `fade` class on the backdrop: Bootstrap's 150ms opacity transition is
+       perceived as input lag in this app (the WebView composites it slowly while
+       a native MediaElement is still painting). The shell hides native videos
+       before this modal renders, so an instant solid backdrop feels snappier
+       and looks consistent against a black canvas. *@
+    <div class="modal-backdrop show"></div>
+    <div class="modal d-block" tabindex="-1" role="dialog" aria-modal="true"
+         @onkeydown:stopPropagation="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title h5 d-flex align-items-center gap-2">
+                        <Icon Name="keyboard" Size="18" />
+                        Keyboard shortcuts
+                    </h2>
+                    <button class="btn-close" type="button" aria-label="Close" @onclick="Close"></button>
+                </div>
+                <div class="modal-body">
+                    @foreach (var group in Groups)
+                    {
+                        <div class="mb-3">
+                            <div class="text-body-secondary fw-semibold text-uppercase small mb-1"
+                                 style="letter-spacing:0.08em;">@group.Title</div>
+                            @foreach (var (label, keys) in group.Rows)
+                            {
+                                <div class="shortcut-row">
+                                    <div class="shortcut-row-label">@label</div>
+                                    <div class="shortcut-row-keys">
+                                        @foreach (var key in keys)
+                                        {
+                                            <kbd class="shortcut-key">@key</kbd>
+                                        }
+                                    </div>
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-outline-secondary" type="button" @onclick="Close">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool IsOpen { get; set; }
+    [Parameter] public EventCallback<bool> IsOpenChanged { get; set; }
+
+    private static readonly IReadOnlyList<ShortcutGroup> Groups =
+    [
+        new("Playback", [
+            ("Play / pause", new[] { "Space" }),
+            ("Next item", new[] { "→" }),
+            ("Previous item", new[] { "←" }),
+            ("Toggle mute", new[] { "M" }),
+        ]),
+        new("View", [
+            ("Toggle fullscreen", new[] { "F" }),
+            ("Exit fullscreen", new[] { "Esc" }),
+            ("Toggle playlist", new[] { "L" }),
+        ]),
+        new("On the canvas (mouse)", [
+            ("Play / pause", new[] { "Click" }),
+            ("Toggle fullscreen", new[] { "Double-click" }),
+            ("Previous (fullscreen single)", new[] { "Triple-click" }),
+        ]),
+        new("Help", [
+            ("Show this dialog", new[] { "?" }),
+        ]),
+    ];
+
+    private async Task Close()
+    {
+        IsOpen = false;
+        await IsOpenChanged.InvokeAsync(IsOpen);
+    }
+
+    private sealed record ShortcutGroup(string Title, IReadOnlyList<(string Label, string[] Keys)> Rows);
+}

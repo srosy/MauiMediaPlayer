@@ -1,0 +1,339 @@
+@implements IDisposable
+@inject PlaylistService Playlist
+@inject PlaybackService Playback
+@inject IFileSystemActionsService FileSystemActions
+@inject ToastService Toasts
+
+@* Playlist sidebar. Phase D: kind stats, type filter chips, sort dropdown
+   (replacing 3 buttons), and hover-revealed row actions. Collapse state is a
+   parameter owned by PlayerShell so the toggle button there stays in sync. *@
+
+<aside class="playlist-panel @(IsCollapsed ? "is-collapsed" : null)"
+       @onkeydown:stopPropagation="true">
+    <div class="playlist-header">
+        <h2 class="playlist-title">Playlist</h2>
+        <span class="playlist-stats">@StatsLine</span>
+        <div class="ms-auto d-flex align-items-center gap-1">
+            <button class="icon-btn"
+                    type="button"
+                    title="Hide playlist (L)"
+                    aria-label="Hide playlist"
+                    @onclick="RequestCollapseAsync">
+                <Icon Name="chevron-right" />
+            </button>
+        </div>
+    </div>
+
+    <div class="playlist-toolbar">
+        <div class="input-icon">
+            <Icon Name="search" Size="14" />
+            <input type="text"
+                   placeholder="Search playlist"
+                   value="@_filter"
+                   @oninput="OnFilterChanged"
+                   aria-label="Search playlist" />
+            @if (!string.IsNullOrEmpty(_filter))
+            {
+                <button class="icon-btn" type="button" title="Clear search"
+                        style="height:24px;width:24px;"
+                        @onclick="() => SetFilter(string.Empty)">
+                    <Icon Name="x-lg" Size="10" />
+                </button>
+            }
+        </div>
+
+        <div class="playlist-filter-chips" role="tablist" aria-label="Filter by media kind">
+            @foreach (var chip in FilterChips)
+            {
+                <button class="filter-chip @(_kindFilter == chip.Kind ? "is-active" : null)"
+                        type="button"
+                        role="tab"
+                        aria-selected="@(_kindFilter == chip.Kind ? "true" : "false")"
+                        @onclick="() => SetKindFilter(chip.Kind)">
+                    @chip.Label
+                </button>
+            }
+        </div>
+
+        <div class="playlist-toolbar-actions">
+            <div class="d-flex align-items-center gap-1">
+                <select class="form-select form-select-sm"
+                        value="@_sortMode"
+                        style="max-width:9rem;"
+                        @onchange="SetSortAsync"
+                        aria-label="Sort order">
+                    <option value="@SortMode.Name">Sort: Name</option>
+                    <option value="@SortMode.Path">Sort: Path</option>
+                    <option value="@SortMode.Newest">Sort: Newest</option>
+                </select>
+                <button class="icon-btn"
+                        type="button"
+                        title="Randomize playlist order"
+                        aria-label="Randomize playlist order"
+                        @onclick="RandomizeOrderAsync"
+                        disabled="@(!Playlist.HasItems)">
+                    <Icon Name="dice-5-fill" />
+                </button>
+            </div>
+        </div>
+    </div>
+
+    @if (Playlist.Items.Count == 0)
+    {
+        <div class="playlist-empty">
+            <Icon Name="list" Size="22" />
+            <div>Add files or a folder to build a playlist.</div>
+        </div>
+    }
+    else if (FilteredItems.Count == 0)
+    {
+        <div class="playlist-empty">
+            <Icon Name="search" Size="22" />
+            <div>No items match the current filters.</div>
+            <button class="btn btn-sm btn-outline-secondary" type="button"
+                    @onclick="ClearFiltersAsync">Reset filters</button>
+        </div>
+    }
+    else
+    {
+        <ul class="playlist-items">
+            @foreach (var item in FilteredItems)
+            {
+                var isCurrent = Playlist.CurrentItem?.Id == item.Id;
+
+                @* HTML5 forbids interactive nesting (button-in-button), so the row is
+                   a flex container with a primary "select" button on the left and a
+                   sibling action cluster on the right. Keyboard users can tab into
+                   each control independently. *@
+                <li class="playlist-item @(isCurrent ? "is-current" : null)">
+                    <button class="playlist-item-main"
+                            type="button"
+                            title="@item.FilePath"
+                            @onclick="() => Playback.SelectAsync(item)">
+                        <span class="playlist-item-icon">
+                            <Icon Name="@IconForKind(item.Kind)" Size="14" />
+                        </span>
+                        <span class="playlist-item-body">
+                            <span class="playlist-item-title">@item.DisplayName</span>
+                            <span class="playlist-item-meta">@item.FilePath</span>
+                        </span>
+                    </button>
+                    <span class="playlist-item-actions">
+                        <button class="icon-btn"
+                                type="button"
+                                style="height:26px;width:26px;"
+                                title="Reveal in file manager"
+                                aria-label="Reveal in file manager"
+                                @onclick="() => RevealAsync(item)">
+                            <Icon Name="box-arrow-up-right" Size="12" />
+                        </button>
+                        <button class="icon-btn"
+                                type="button"
+                                style="height:26px;width:26px;"
+                                title="Remove from playlist"
+                                aria-label="Remove from playlist"
+                                @onclick="() => RemoveAsync(item)">
+                            <Icon Name="trash" Size="12" />
+                        </button>
+                    </span>
+                </li>
+            }
+        </ul>
+    }
+</aside>
+
+@code {
+    [Parameter] public bool IsCollapsed { get; set; }
+    [Parameter] public EventCallback<bool> IsCollapsedChanged { get; set; }
+    [Parameter] public EventCallback<string> OnStatusChanged { get; set; }
+
+    private enum SortMode { Name, Path, Newest }
+
+    private string _filter = string.Empty;
+    private MediaKind? _kindFilter;
+    private SortMode _sortMode = SortMode.Name;
+
+    private static readonly IReadOnlyList<(MediaKind? Kind, string Label)> FilterChips =
+    [
+        (null, "All"),
+        (MediaKind.Image, "Images"),
+        (MediaKind.Video, "Videos"),
+        (MediaKind.Gif, "GIFs"),
+    ];
+
+    private string StatsLine
+    {
+        get
+        {
+            var total = Playlist.Items.Count;
+
+            if (total == 0)
+            {
+                return "0 items";
+            }
+
+            var imageCount = 0;
+            var videoCount = 0;
+            var gifCount = 0;
+
+            foreach (var item in Playlist.Items)
+            {
+                switch (item.Kind)
+                {
+                    case MediaKind.Image: imageCount++; break;
+                    case MediaKind.Video: videoCount++; break;
+                    case MediaKind.Gif: gifCount++; break;
+                }
+            }
+
+            var parts = new List<string> { $"{total} item{(total == 1 ? "" : "s")}" };
+            if (videoCount > 0) parts.Add($"{videoCount} video{(videoCount == 1 ? "" : "s")}");
+            if (imageCount > 0) parts.Add($"{imageCount} image{(imageCount == 1 ? "" : "s")}");
+            if (gifCount > 0) parts.Add($"{gifCount} GIF{(gifCount == 1 ? "" : "s")}");
+
+            return string.Join(" \u00B7 ", parts);
+        }
+    }
+
+    private List<MediaItem> FilteredItems
+    {
+        get
+        {
+            IEnumerable<MediaItem> items = Playlist.Items;
+
+            if (_kindFilter is MediaKind kind)
+            {
+                items = items.Where(item => item.Kind == kind);
+            }
+
+            if (!string.IsNullOrWhiteSpace(_filter))
+            {
+                items = items.Where(item =>
+                    item.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                    || item.FilePath.Contains(_filter, StringComparison.OrdinalIgnoreCase));
+            }
+
+            return items.ToList();
+        }
+    }
+
+    protected override void OnInitialized()
+    {
+        Playlist.Changed += OnStateChanged;
+    }
+
+    private void OnFilterChanged(ChangeEventArgs args)
+    {
+        SetFilter(args.Value?.ToString() ?? string.Empty);
+    }
+
+    private void SetFilter(string value)
+    {
+        _filter = value;
+    }
+
+    private void SetKindFilter(MediaKind? kind)
+    {
+        _kindFilter = kind;
+    }
+
+    private async Task SetSortAsync(ChangeEventArgs args)
+    {
+        if (!Enum.TryParse<SortMode>(args.Value?.ToString(), out var mode))
+        {
+            return;
+        }
+
+        _sortMode = mode;
+
+        switch (mode)
+        {
+            case SortMode.Name:
+                Playlist.SortByName();
+                break;
+            case SortMode.Path:
+                Playlist.SortByPath();
+                break;
+            case SortMode.Newest:
+                Playlist.SortByDateModified();
+                break;
+        }
+
+        await Playback.RefreshPlaylistAsync();
+    }
+
+    private async Task RandomizeOrderAsync()
+    {
+        Playlist.ShuffleItems();
+        await Playback.RefreshPlaylistAsync();
+    }
+
+    private async Task ClearFiltersAsync()
+    {
+        _filter = string.Empty;
+        _kindFilter = null;
+        await Task.CompletedTask;
+    }
+
+    private async Task RevealAsync(MediaItem item)
+    {
+        try
+        {
+            await FileSystemActions.RevealInFileManagerAsync(item);
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not reveal {item.DisplayName}: {exception.Message}");
+        }
+    }
+
+    private async Task RemoveAsync(MediaItem item)
+    {
+        var wasCurrent = Playlist.CurrentItem?.Id == item.Id;
+        var previousStatus = Playback.Status;
+        Playlist.Remove(item);
+
+        if (!Playlist.HasItems)
+        {
+            await Playback.StopAsync();
+        }
+        else if (wasCurrent)
+        {
+            if (previousStatus == PlaybackStatus.Playing)
+            {
+                await Playback.PlayAsync();
+            }
+            else
+            {
+                await Playback.StopAsync();
+            }
+        }
+
+        Toasts.Info($"Removed {item.DisplayName}");
+        await OnStatusChanged.InvokeAsync($"Removed {item.DisplayName}.");
+    }
+
+    private async Task RequestCollapseAsync()
+    {
+        IsCollapsed = true;
+        await IsCollapsedChanged.InvokeAsync(IsCollapsed);
+    }
+
+    private static string IconForKind(MediaKind kind) => kind switch
+    {
+        MediaKind.Image => "image",
+        MediaKind.Video => "film",
+        MediaKind.Gif => "file-earmark-music",
+        _ => "file-earmark",
+    };
+
+    private void OnStateChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        Playlist.Changed -= OnStateChanged;
+    }
+}
