@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:local="clr-namespace:MauiMediaPlayer"
+             xmlns:components="clr-namespace:MauiMediaPlayer.Components"
+             xmlns:toolkit="http://schemas.microsoft.com/dotnet/2022/maui/toolkit"
+             x:Class="MauiMediaPlayer.MainPage">
+
+    <AbsoluteLayout x:Name="rootLayout">
+        <BlazorWebView x:Name="blazorWebView"
+                       AbsoluteLayout.LayoutBounds="0,0,1,1"
+                       AbsoluteLayout.LayoutFlags="All"
+                       ZIndex="0"
+                       HostPage="wwwroot/index.html">
+            <BlazorWebView.RootComponents>
+                <RootComponent Selector="#app" ComponentType="{x:Type components:Routes}" />
+            </BlazorWebView.RootComponents>
+        </BlazorWebView>
+
+        <toolkit:MediaElement x:Name="nativeVideoElement0"
+                              AbsoluteLayout.LayoutBounds="-10000,-10000,1,1"
+                              Aspect="AspectFit"
+                              BackgroundColor="Black"
+                              InputTransparent="False"
+                              IsVisible="True"
+                              Opacity="0"
+                              ShouldAutoPlay="False"
+                              ShouldKeepScreenOn="True"
+                              ShouldShowPlaybackControls="False"
+                              ZIndex="10" />
+
+        <toolkit:MediaElement x:Name="nativeVideoElement1"
+                              AbsoluteLayout.LayoutBounds="-10000,-10000,1,1"
+                              Aspect="AspectFit"
+                              BackgroundColor="Black"
+                              InputTransparent="False"
+                              IsVisible="True"
+                              Opacity="0"
+                              ShouldAutoPlay="False"
+                              ShouldKeepScreenOn="True"
+                              ShouldShowPlaybackControls="False"
+                              ZIndex="11" />
+
+        <toolkit:MediaElement x:Name="nativeVideoElement2"
+                              AbsoluteLayout.LayoutBounds="-10000,-10000,1,1"
+                              Aspect="AspectFit"
+                              BackgroundColor="Black"
+                              InputTransparent="False"
+                              IsVisible="True"
+                              Opacity="0"
+                              ShouldAutoPlay="False"
+                              ShouldKeepScreenOn="True"
+                              ShouldShowPlaybackControls="False"
+                              ZIndex="12" />
+    </AbsoluteLayout>
+
+</ContentPage>

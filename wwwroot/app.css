@@ -1,0 +1,1378 @@
+/* ============================================================================
+   Mosaic — UI/UX overhaul stylesheet (Phase A-F).
+   Organized top-to-bottom:
+     1. Theme tokens + global resets
+     2. Layout regions (shell, header, body, transport, playlist)
+     3. Components (icon buttons, popover, toasts, modals)
+     4. Media viewport + panes
+     5. Empty state + drag-drop
+     6. Fullscreen + responsive overrides
+   Bootstrap is loaded BEFORE this file, so we layer dark-theme tokens on top
+   via [data-bs-theme="dark"]. The accent (brand violet) overrides Bootstrap's
+   primary across all themes for visual cohesion.
+   ============================================================================ */
+
+/* ----- 1. THEME TOKENS ----- */
+:root {
+    --brand: #7C3AED;
+    --brand-hover: #6D28D9;
+    --brand-soft: rgba(124, 58, 237, 0.18);
+    --brand-soft-strong: rgba(124, 58, 237, 0.32);
+
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+
+    --transition-fast: 120ms ease-in-out;
+    --transition-med: 200ms ease;
+
+    --shadow-elev-1: 0 1px 2px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.10);
+    --shadow-elev-2: 0 4px 12px rgba(0, 0, 0, 0.30), 0 2px 6px rgba(0, 0, 0, 0.20);
+    --shadow-elev-3: 0 16px 40px rgba(0, 0, 0, 0.45);
+
+    /* Approximate Bootstrap primary via the brand. Used by .btn-primary etc. */
+    --bs-primary: var(--brand);
+    --bs-primary-rgb: 124, 58, 237;
+    --bs-link-color: var(--brand);
+    --bs-link-color-rgb: 124, 58, 237;
+    --bs-link-hover-color: var(--brand-hover);
+}
+
+[data-bs-theme="dark"] {
+    --bs-body-bg: #0E1116;
+    --bs-body-color: #E5E7EB;
+    --bs-secondary-bg: #161A21;
+    --bs-tertiary-bg: #1B2029;
+    --bs-border-color: #232A36;
+    --bs-body-color-rgb: 229, 231, 235;
+    --bs-secondary-color: rgba(229, 231, 235, 0.72);
+    --bs-tertiary-color: rgba(229, 231, 235, 0.52);
+}
+
+html, body {
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    height: 100%;
+    overflow: hidden;
+}
+
+body {
+    background: var(--bs-body-bg);
+    color: var(--bs-body-color);
+}
+
+/* Always-on dark scrollbars to match shell. */
+* {
+    scrollbar-color: var(--bs-border-color) transparent;
+    scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--bs-border-color);
+    border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--brand);
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+/* Brand button accent (Bootstrap fallbacks). */
+.btn-primary {
+    --bs-btn-bg: var(--brand);
+    --bs-btn-border-color: var(--brand);
+    --bs-btn-hover-bg: var(--brand-hover);
+    --bs-btn-hover-border-color: var(--brand-hover);
+    --bs-btn-active-bg: var(--brand-hover);
+    --bs-btn-active-border-color: var(--brand-hover);
+    --bs-btn-disabled-bg: var(--brand);
+    --bs-btn-disabled-border-color: var(--brand);
+    color: #fff !important;
+}
+
+.btn-outline-primary {
+    --bs-btn-color: var(--brand);
+    --bs-btn-border-color: var(--brand);
+    --bs-btn-hover-bg: var(--brand);
+    --bs-btn-hover-border-color: var(--brand);
+    --bs-btn-active-bg: var(--brand);
+    --bs-btn-active-border-color: var(--brand);
+}
+
+.btn:focus, .btn:focus-visible, .form-control:focus, .form-select:focus, .form-check-input:focus, .form-range:focus {
+    box-shadow: 0 0 0 0.2rem var(--brand-soft);
+    border-color: var(--brand);
+    outline: none;
+}
+
+a, .btn-link {
+    color: var(--brand);
+}
+
+.text-brand {
+    color: var(--brand) !important;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+h1:focus {
+    outline: none;
+}
+
+.valid.modified:not([type=checkbox]) {
+    outline: 1px solid #26b050;
+}
+
+.invalid {
+    outline: 1px solid #e50000;
+}
+
+.validation-message {
+    color: #e50000;
+}
+
+#blazor-error-ui {
+    color-scheme: light only;
+    background: lightyellow;
+    bottom: 0;
+    box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.2);
+    box-sizing: border-box;
+    display: none;
+    left: 0;
+    padding: 0.6rem 1.25rem 0.7rem 1.25rem;
+    position: fixed;
+    width: 100%;
+    z-index: 1000;
+}
+
+#blazor-error-ui .dismiss {
+    cursor: pointer;
+    position: absolute;
+    right: 0.75rem;
+    top: 0.5rem;
+}
+
+.status-bar-safe-area {
+    display: none;
+}
+
+/* ----- 2. LAYOUT REGIONS ----- */
+.player-shell {
+    background: var(--bs-body-bg);
+    color: var(--bs-body-color);
+    display: grid;
+    grid-template-rows: auto 1fr auto auto;
+    height: 100vh;
+    outline: none;
+    overflow: hidden;
+}
+
+/* Compact header bar: brand + spacer + actions + overflow. ~48px tall. */
+.player-header {
+    align-items: center;
+    background: linear-gradient(180deg, rgba(124, 58, 237, 0.06) 0%, transparent 100%), var(--bs-body-bg);
+    border-bottom: 1px solid var(--bs-border-color);
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.5rem 0.875rem;
+    z-index: 4;
+}
+
+.player-brand {
+    align-items: center;
+    color: var(--bs-body-color);
+    display: flex;
+    gap: 0.625rem;
+    text-decoration: none;
+}
+
+.player-brand:hover {
+    color: var(--bs-body-color);
+}
+
+.player-brand-mark {
+    align-items: center;
+    background: var(--brand);
+    border-radius: var(--radius-sm);
+    color: #fff;
+    display: flex;
+    height: 28px;
+    justify-content: center;
+    width: 28px;
+}
+
+.player-brand-text {
+    line-height: 1.05;
+}
+
+.player-brand-text strong {
+    display: block;
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.player-brand-text small {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+}
+
+.player-header-spacer {
+    flex: 1;
+}
+
+.player-header-actions {
+    align-items: center;
+    display: flex;
+    gap: 0.375rem;
+}
+
+.player-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--playlist-width, minmax(18rem, 22rem));
+    min-height: 0;
+    overflow: hidden;
+}
+
+.player-body.playlist-collapsed {
+    grid-template-columns: minmax(0, 1fr) 0;
+}
+
+.player-main {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* Transport bar: single row, grouped clusters, full-width progress on top. */
+.transport-bar {
+    background: var(--bs-secondary-bg);
+    border-top: 1px solid var(--bs-border-color);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    z-index: 2;
+}
+
+.transport-progress {
+    align-items: center;
+    background: var(--bs-tertiary-bg);
+    display: flex;
+    gap: 0.625rem;
+    padding: 0.375rem 0.75rem 0;
+}
+
+.transport-progress .progress {
+    background: rgba(255, 255, 255, 0.07);
+    border-radius: 999px;
+    flex: 1;
+    height: 4px;
+}
+
+.transport-progress .progress-bar {
+    background: var(--brand);
+    transition: width 200ms linear;
+}
+
+.transport-progress-range {
+    appearance: none;
+    background: transparent;
+    flex: 1;
+    height: 4px;
+    margin: 0;
+    padding: 0;
+}
+
+.transport-progress-range::-webkit-slider-runnable-track {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    height: 4px;
+}
+
+.transport-progress-range::-webkit-slider-thumb {
+    appearance: none;
+    background: var(--brand);
+    border: 0;
+    border-radius: 50%;
+    height: 14px;
+    margin-top: -5px;
+    width: 14px;
+}
+
+.transport-progress-range::-moz-range-track {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    height: 4px;
+}
+
+.transport-progress-range::-moz-range-thumb {
+    background: var(--brand);
+    border: 0;
+    border-radius: 50%;
+    height: 14px;
+    width: 14px;
+}
+
+.transport-progress-range:disabled::-webkit-slider-thumb {
+    background: var(--bs-border-color);
+}
+
+.transport-progress-range:disabled::-moz-range-thumb {
+    background: var(--bs-border-color);
+}
+
+.transport-time {
+    color: var(--bs-secondary-color);
+    font-feature-settings: 'tnum';
+    font-size: 0.72rem;
+    min-width: 4.5rem;
+    text-align: right;
+}
+
+.transport-time:first-child {
+    text-align: left;
+}
+
+.transport-row {
+    align-items: center;
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0.75rem;
+    padding: 0.4rem 0.75rem 0.5rem;
+}
+
+.transport-cluster {
+    align-items: center;
+    display: flex;
+    gap: 0.25rem;
+}
+
+.transport-cluster + .transport-cluster {
+    border-left: 1px solid var(--bs-border-color);
+    padding-left: 0.625rem;
+}
+
+.transport-spacer {
+    flex: 1;
+}
+
+.transport-nowplaying {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    line-height: 1.1;
+    min-width: 0;
+    overflow: hidden;
+    text-align: center;
+}
+
+.transport-nowplaying-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.transport-nowplaying-meta {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Generic icon button. Square, 32x32, ghost by default; toggled state lights up
+   with the brand-soft halo. Big-play variant is the central focal point. */
+.icon-btn {
+    align-items: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--bs-body-color);
+    cursor: pointer;
+    display: inline-flex;
+    flex: 0 0 auto;
+    height: 32px;
+    justify-content: center;
+    padding: 0;
+    position: relative;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast), transform 80ms ease;
+    width: 32px;
+}
+
+.icon-btn:hover:not(:disabled) {
+    background: var(--bs-tertiary-bg);
+    color: #fff;
+}
+
+.icon-btn:active:not(:disabled) {
+    transform: scale(0.94);
+}
+
+.icon-btn:disabled {
+    color: var(--bs-tertiary-color);
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+.icon-btn.is-active {
+    background: var(--brand-soft);
+    color: var(--brand);
+}
+
+.icon-btn.is-active:hover:not(:disabled) {
+    background: var(--brand-soft-strong);
+    color: #fff;
+}
+
+.icon-btn.is-primary {
+    background: var(--brand);
+    color: #fff;
+    height: 38px;
+    width: 38px;
+}
+
+.icon-btn.is-primary:hover:not(:disabled) {
+    background: var(--brand-hover);
+    color: #fff;
+}
+
+.icon-btn-label {
+    color: inherit;
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 0 0.5rem;
+}
+
+.icon-btn-with-label {
+    gap: 0.4rem;
+    padding: 0 0.625rem;
+    width: auto;
+}
+
+/* Settings popover. Bootstrap doesn't ship a popover host that auto-positions
+   without JS; we anchor it relative to the trigger via .icon-btn-anchor and
+   absolute-position the popover beneath. Closes on outside click via JS handler. */
+.icon-btn-anchor {
+    position: relative;
+}
+
+.app-popover {
+    background: var(--bs-secondary-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-elev-2);
+    bottom: calc(100% + 0.5rem);
+    color: var(--bs-body-color);
+    min-width: 22rem;
+    padding: 1rem;
+    position: absolute;
+    right: 0;
+    z-index: 20;
+}
+
+.app-popover-title {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    margin-bottom: 0.5rem;
+    text-transform: uppercase;
+}
+
+.app-popover-row + .app-popover-row {
+    border-top: 1px solid var(--bs-border-color);
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+}
+
+.app-popover .form-label {
+    color: var(--bs-secondary-color);
+    font-size: 0.75rem;
+    margin-bottom: 0.25rem;
+}
+
+.app-popover .form-text {
+    color: var(--bs-tertiary-color);
+}
+
+/* Overflow menu (3-dots) reuses .app-popover with item rows. */
+.app-popover-menu {
+    min-width: 13rem;
+    padding: 0.375rem;
+}
+
+.app-popover-menu .menu-item {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: inherit;
+    cursor: pointer;
+    display: flex;
+    font-size: 0.85rem;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    text-align: left;
+    width: 100%;
+}
+
+.app-popover-menu .menu-item:hover {
+    background: var(--bs-tertiary-bg);
+}
+
+.app-popover-menu .menu-item .menu-shortcut {
+    color: var(--bs-tertiary-color);
+    font-size: 0.7rem;
+    margin-left: auto;
+}
+
+.app-popover-menu .menu-divider {
+    background: var(--bs-border-color);
+    height: 1px;
+    margin: 0.25rem 0.25rem;
+}
+
+/* ----- 3. PLAYLIST PANEL ----- */
+.playlist-panel {
+    background: var(--bs-secondary-bg);
+    border-left: 1px solid var(--bs-border-color);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.playlist-panel.is-collapsed {
+    display: none;
+}
+
+.playlist-header {
+    align-items: center;
+    background: var(--bs-secondary-bg);
+    border-bottom: 1px solid var(--bs-border-color);
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.625rem 0.75rem;
+}
+
+.playlist-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 0;
+}
+
+.playlist-stats {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+    margin-left: 0.25rem;
+}
+
+.playlist-toolbar {
+    background: var(--bs-secondary-bg);
+    border-bottom: 1px solid var(--bs-border-color);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem 0.625rem;
+}
+
+.playlist-toolbar .input-icon {
+    align-items: center;
+    background: var(--bs-tertiary-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--radius-sm);
+    display: flex;
+    gap: 0.5rem;
+    padding: 0 0.5rem;
+    transition: border-color var(--transition-fast);
+}
+
+.playlist-toolbar .input-icon:focus-within {
+    border-color: var(--brand);
+    box-shadow: 0 0 0 0.15rem var(--brand-soft);
+}
+
+.playlist-toolbar .input-icon .bi {
+    color: var(--bs-tertiary-color);
+    flex: 0 0 auto;
+}
+
+.playlist-toolbar input[type=text] {
+    background: transparent;
+    border: 0;
+    color: var(--bs-body-color);
+    flex: 1;
+    font-size: 0.85rem;
+    height: 28px;
+    outline: none;
+    padding: 0;
+}
+
+.playlist-toolbar input[type=text]::placeholder {
+    color: var(--bs-tertiary-color);
+}
+
+.playlist-toolbar-actions {
+    align-items: center;
+    display: flex;
+    gap: 0.25rem;
+    justify-content: space-between;
+}
+
+.playlist-filter-chips {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+}
+
+.filter-chip {
+    background: var(--bs-tertiary-bg);
+    border: 1px solid transparent;
+    border-radius: 999px;
+    color: var(--bs-secondary-color);
+    cursor: pointer;
+    font-size: 0.7rem;
+    font-weight: 500;
+    padding: 0.15rem 0.55rem;
+    transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.filter-chip:hover {
+    background: var(--bs-border-color);
+    color: var(--bs-body-color);
+}
+
+.filter-chip.is-active {
+    background: var(--brand-soft);
+    border-color: var(--brand);
+    color: var(--brand);
+}
+
+.playlist-items {
+    flex: 1;
+    list-style: none;
+    margin: 0;
+    overflow-y: auto;
+    padding: 0;
+}
+
+.playlist-item {
+    align-items: stretch;
+    border-bottom: 1px solid var(--bs-border-color);
+    display: flex;
+    gap: 0.25rem;
+    padding-right: 0.5rem;
+    transition: background var(--transition-fast);
+}
+
+.playlist-item:hover {
+    background: var(--bs-tertiary-bg);
+}
+
+.playlist-item.is-current {
+    background: var(--brand-soft);
+    color: #fff;
+}
+
+.playlist-item.is-current:hover {
+    background: var(--brand-soft-strong);
+}
+
+.playlist-item-main {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    display: flex;
+    flex: 1;
+    gap: 0.5rem;
+    min-width: 0;
+    padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+    text-align: left;
+}
+
+.playlist-item-main:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: -2px;
+}
+
+.playlist-item-icon {
+    align-items: center;
+    background: var(--bs-tertiary-bg);
+    border-radius: var(--radius-sm);
+    color: var(--bs-secondary-color);
+    display: flex;
+    flex: 0 0 auto;
+    height: 32px;
+    justify-content: center;
+    width: 32px;
+}
+
+.playlist-item.is-current .playlist-item-icon {
+    background: var(--brand);
+    color: #fff;
+}
+
+.playlist-item-body {
+    flex: 1;
+    min-width: 0;
+}
+
+.playlist-item-title {
+    font-size: 0.85rem;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.playlist-item-meta {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.playlist-item.is-current .playlist-item-meta {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.playlist-item-actions {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 0.125rem;
+    opacity: 0;
+    transition: opacity var(--transition-fast);
+}
+
+.playlist-item:hover .playlist-item-actions,
+.playlist-item.is-current .playlist-item-actions,
+.playlist-item:focus-within .playlist-item-actions {
+    opacity: 1;
+}
+
+.playlist-empty {
+    align-items: center;
+    color: var(--bs-tertiary-color);
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    font-size: 0.85rem;
+    gap: 0.5rem;
+    justify-content: center;
+    padding: 1.5rem;
+    text-align: center;
+}
+
+/* ----- 4. MEDIA VIEWPORT + PANES ----- */
+.media-viewport {
+    align-items: center;
+    background: #000;
+    color: #fff;
+    display: flex;
+    flex: 1;
+    justify-content: center;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.media-viewport.is-drag-over::after {
+    border: 2px dashed var(--brand);
+    border-radius: var(--radius-md);
+    bottom: 1rem;
+    color: var(--brand);
+    content: "Drop to add media";
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1rem;
+    font-weight: 600;
+    left: 1rem;
+    pointer-events: none;
+    position: absolute;
+    right: 1rem;
+    top: 1rem;
+    background: rgba(124, 58, 237, 0.08);
+    z-index: 4;
+}
+
+.media-video,
+.media-image {
+    height: 100%;
+    max-height: 100%;
+    max-width: 100%;
+    object-fit: contain;
+    width: 100%;
+}
+
+.media-image-holdover,
+.media-image-ready {
+    opacity: 1;
+    transition: opacity var(--transition-fast);
+}
+
+.native-video-placeholder {
+    background: #000;
+    height: 100%;
+    width: 100%;
+}
+
+/* Video panes: clip HTML "underlay" content (holdover image, placeholder div)
+   to the exact region the native MediaElement covers. Without this, the bottom
+   strip reserved for the caption HTML would otherwise reveal the slot's last
+   shown image (the holdover) through the caption gradient's transparent top —
+   appearing as a thin band of the *previous* item below each pane.
+   `--caption-inset` is set per-pane by mauiMediaPlayer.getMediaPaneBounds so
+   the clip always matches the live caption height (including any future font
+   or padding tweaks). Falls back to 0 if JS hasn't measured yet, which simply
+   leaves the bleed on first paint until the first bounds update. */
+.media-pane.is-video-pane .media-image-holdover,
+.media-pane.is-video-pane .native-video-placeholder {
+    clip-path: inset(0 0 var(--caption-inset, 0px) 0);
+}
+
+.media-split {
+    align-items: stretch;
+    display: grid;
+    gap: 2px;
+    height: 100%;
+    justify-content: stretch;
+    width: 100%;
+}
+
+.media-split-0,
+.media-split-1 {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr);
+}
+
+.media-split-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1fr);
+}
+
+.media-split-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1fr);
+}
+
+.media-pane {
+    /* Default inset matches the typical rendered caption height (~3rem). JS
+       refines this per-pane in mauiMediaPlayer.getMediaPaneBounds so the value
+       always matches the live caption box. The fallback prevents a flash of
+       holdover bleed on the very first paint, before JS has measured. */
+    --caption-inset: 3rem;
+    align-items: center;
+    background: #000;
+    display: flex;
+    justify-content: center;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.media-caption {
+    align-items: center;
+    background: linear-gradient(0deg, rgba(0, 0, 0, 0.75) 0%, rgba(0, 0, 0, 0) 100%);
+    bottom: 0;
+    color: #fff;
+    display: flex;
+    gap: 0.625rem;
+    justify-content: space-between;
+    left: 0;
+    padding: 1.5rem 0.75rem 0.5rem;
+    position: absolute;
+    right: 0;
+    z-index: 3;
+}
+
+.media-caption-title {
+    font-size: 0.85rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.media-caption-actions {
+    align-items: center;
+    display: flex;
+    flex-shrink: 0;
+    gap: 0.375rem;
+}
+
+.media-caption-kind {
+    background: rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    color: #fff;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 0.1rem 0.45rem;
+    text-transform: uppercase;
+}
+
+.media-skip-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: #fff;
+    cursor: pointer;
+    display: inline-flex;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast);
+    width: 26px;
+}
+
+.media-skip-btn:hover {
+    background: var(--brand);
+}
+
+.is-fullscreen .media-caption {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-med);
+}
+
+.is-fullscreen.is-mouse-active .media-caption {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* ----- 5. EMPTY STATE ----- */
+.empty-state {
+    align-items: center;
+    color: rgba(255, 255, 255, 0.85);
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    max-width: 32rem;
+    padding: 2rem;
+    text-align: center;
+}
+
+.empty-state-icon {
+    align-items: center;
+    background: var(--brand-soft);
+    border-radius: var(--radius-lg);
+    color: var(--brand);
+    display: flex;
+    height: 72px;
+    justify-content: center;
+    width: 72px;
+}
+
+.empty-state-title {
+    font-size: 1.25rem;
+    font-weight: 600;
+}
+
+.empty-state-text {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 0.9rem;
+    margin: 0;
+}
+
+.empty-state-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.empty-state-hint {
+    border: 1px dashed rgba(255, 255, 255, 0.18);
+    border-radius: var(--radius-md);
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+    padding: 0.75rem 1rem;
+}
+
+/* ----- 6. DEBUG FOOTER (collapsible) ----- */
+.debug-footer {
+    background: var(--bs-secondary-bg);
+    border-top: 1px solid var(--bs-border-color);
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+    transition: max-height var(--transition-med);
+    z-index: 2;
+}
+
+.debug-footer.is-collapsed {
+    max-height: 32px;
+}
+
+.debug-footer.is-expanded {
+    max-height: 14rem;
+}
+
+.debug-footer-bar {
+    align-items: center;
+    cursor: pointer;
+    display: flex;
+    flex: 0 0 32px;
+    gap: 0.5rem;
+    padding: 0 0.625rem;
+    user-select: none;
+}
+
+.debug-footer-bar:hover {
+    background: var(--bs-tertiary-bg);
+}
+
+.debug-footer-title {
+    color: var(--bs-secondary-color);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.debug-footer-actions {
+    align-items: center;
+    display: flex;
+    gap: 0.25rem;
+    margin-left: auto;
+}
+
+.debug-footer-status {
+    color: var(--bs-tertiary-color);
+    font-size: 0.7rem;
+}
+
+.debug-footer-body {
+    overflow: hidden;
+    padding: 0 0.625rem 0.5rem;
+}
+
+.debug-log-text {
+    background: var(--bs-body-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--radius-sm);
+    color: var(--bs-body-color);
+    font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Courier New', monospace;
+    font-size: 0.72rem;
+    height: 9rem;
+    line-height: 1.35;
+    padding: 0.5rem;
+    resize: none;
+    width: 100%;
+}
+
+/* ----- 7. ADD-MEDIA + MODALS ----- */
+.add-media-paths {
+    background: var(--bs-tertiary-bg);
+    border-color: var(--bs-border-color);
+    color: var(--bs-body-color);
+    min-height: 8rem;
+}
+
+.add-media-pending {
+    max-height: 12rem;
+    overflow: auto;
+}
+
+.modal-content {
+    background: var(--bs-secondary-bg);
+    border: 1px solid var(--bs-border-color);
+    box-shadow: var(--shadow-elev-3);
+    color: var(--bs-body-color);
+}
+
+.modal-header,
+.modal-footer {
+    border-color: var(--bs-border-color);
+}
+
+.modal-content .btn-close {
+    filter: invert(1) grayscale(100%) brightness(2);
+    opacity: 0.7;
+}
+
+.shortcut-key {
+    background: var(--bs-tertiary-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--radius-sm);
+    color: var(--bs-body-color);
+    display: inline-block;
+    font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1;
+    min-width: 1.5rem;
+    padding: 0.2rem 0.4rem;
+    text-align: center;
+}
+
+.shortcut-row {
+    align-items: center;
+    border-bottom: 1px solid var(--bs-border-color);
+    display: flex;
+    gap: 0.625rem;
+    padding: 0.45rem 0;
+}
+
+.shortcut-row:last-child {
+    border-bottom: 0;
+}
+
+.shortcut-row-label {
+    flex: 1;
+    font-size: 0.875rem;
+}
+
+.shortcut-row-keys {
+    align-items: center;
+    display: flex;
+    gap: 0.25rem;
+}
+
+.about-art {
+    align-items: center;
+    background: linear-gradient(135deg, var(--brand) 0%, var(--brand-hover) 100%);
+    border-radius: var(--radius-md);
+    color: #fff;
+    display: flex;
+    height: 96px;
+    justify-content: center;
+    margin-bottom: 1rem;
+    width: 96px;
+}
+
+/* ----- 8. TOASTS ----- */
+.toast-host {
+    bottom: 6.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    left: 50%;
+    pointer-events: none;
+    position: fixed;
+    transform: translateX(-50%);
+    width: min(28rem, 90vw);
+    z-index: 60;
+}
+
+.toast-card {
+    align-items: flex-start;
+    animation: toast-in 220ms ease forwards;
+    background: var(--bs-secondary-bg);
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-elev-2);
+    color: var(--bs-body-color);
+    display: flex;
+    gap: 0.625rem;
+    padding: 0.625rem 0.75rem;
+    pointer-events: auto;
+}
+
+.toast-card.is-leaving {
+    animation: toast-out 220ms ease forwards;
+}
+
+.toast-card.toast-info {
+    border-left: 3px solid var(--brand);
+}
+
+.toast-card.toast-error {
+    border-left: 3px solid #ef4444;
+}
+
+.toast-card.toast-success {
+    border-left: 3px solid #10b981;
+}
+
+.toast-body {
+    flex: 1;
+    font-size: 0.85rem;
+    line-height: 1.35;
+}
+
+.toast-close {
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: var(--bs-secondary-color);
+    cursor: pointer;
+    flex: 0 0 auto;
+    height: 24px;
+    padding: 0;
+    width: 24px;
+}
+
+.toast-close:hover {
+    background: var(--bs-tertiary-bg);
+    color: var(--bs-body-color);
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes toast-out {
+    from {
+        opacity: 1;
+        transform: translateY(0);
+    }
+    to {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+}
+
+/* ----- 9. FORMS in dark theme ----- */
+.form-control, .form-select {
+    background: var(--bs-tertiary-bg);
+    border-color: var(--bs-border-color);
+    color: var(--bs-body-color);
+}
+
+.form-control:focus, .form-select:focus {
+    background: var(--bs-tertiary-bg);
+    color: var(--bs-body-color);
+}
+
+.form-check-input {
+    background-color: var(--bs-tertiary-bg);
+    border-color: var(--bs-border-color);
+}
+
+.form-check-input:checked {
+    background-color: var(--brand);
+    border-color: var(--brand);
+}
+
+.form-range::-webkit-slider-thumb {
+    background: var(--brand);
+}
+
+.form-range::-moz-range-thumb {
+    background: var(--brand);
+}
+
+/* ----- 10. FULLSCREEN + RESPONSIVE ----- */
+.is-fullscreen .player-header,
+.is-fullscreen .transport-bar,
+.is-fullscreen .debug-footer,
+.is-fullscreen .toast-host {
+    display: none;
+}
+
+.is-fullscreen .player-body {
+    grid-template-columns: 1fr;
+}
+
+.is-fullscreen .playlist-panel {
+    display: none;
+}
+
+.is-fullscreen .media-viewport {
+    min-height: 0;
+}
+
+/* Compact mode: keeps the transport (the user's most-used row) but hides the
+   header, debug footer, and playlist. Useful when running the slideshow as
+   "almost fullscreen" on a smaller window without losing the controls. */
+.is-compact .player-header,
+.is-compact .debug-footer {
+    display: none;
+}
+
+.is-compact .player-body {
+    grid-template-columns: 1fr;
+}
+
+.is-compact .playlist-panel {
+    display: none;
+}
+
+@media (max-width: 992px) {
+    .player-body {
+        grid-template-columns: 1fr;
+    }
+
+    .playlist-panel {
+        border-left: 0;
+        border-top: 1px solid var(--bs-border-color);
+        max-height: 24rem;
+    }
+
+    .media-split-2,
+    .media-split-3 {
+        grid-template-columns: 1fr;
+    }
+
+    .media-split-2 {
+        grid-template-rows: repeat(2, minmax(0, 1fr));
+    }
+
+    .media-split-3 {
+        grid-template-rows: repeat(3, minmax(0, 1fr));
+    }
+
+    .transport-cluster + .transport-cluster {
+        border-left: 0;
+        padding-left: 0;
+    }
+
+    .transport-row {
+        flex-wrap: wrap;
+    }
+
+    .transport-nowplaying {
+        order: 4;
+        flex: 1 1 100%;
+    }
+}
+
+@supports (-webkit-touch-callout: none) {
+    .player-shell {
+        height: calc(100vh - env(safe-area-inset-top));
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
+    }
+
+    .status-bar-safe-area {
+        display: flex;
+        position: sticky;
+        top: 0;
+        height: env(safe-area-inset-top);
+        background-color: var(--bs-secondary-bg);
+        width: 100%;
+        z-index: 1;
+    }
+
+    .media-caption,
+    .transport-bar,
+    .debug-footer {
+        padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+    }
+}

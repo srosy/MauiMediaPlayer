@@ -1,0 +1,24 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install MAUI (Windows)
+        run: dotnet workload install maui-windows --skip-sign-check
+
+      - name: Build (Windows target only)
+        run: dotnet build MauiMediaPlayer.csproj -c Release -p:TargetFrameworks=net10.0-windows10.0.19041.0

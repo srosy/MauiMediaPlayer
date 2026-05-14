@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.5.11801.241 oobstable
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MauiMediaPlayer", "MauiMediaPlayer.csproj", "{7ED647D3-384E-2FE2-7C56-559E82307293}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7ED647D3-384E-2FE2-7C56-559E82307293}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7ED647D3-384E-2FE2-7C56-559E82307293}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7ED647D3-384E-2FE2-7C56-559E82307293}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7ED647D3-384E-2FE2-7C56-559E82307293}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {8BE1786D-70CB-4D44-B3CE-D2A5793E618E}
+	EndGlobalSection
+EndGlobal
