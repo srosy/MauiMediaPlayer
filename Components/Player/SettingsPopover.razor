@@ -1,136 +1,18 @@
 @implements IDisposable
-@inject PlaybackService Playback
-@inject PlaylistService Playlist
 @inject PopoverStateService Popovers
+@inject NativeVideoPlaybackService NativeVideo
 
-@* Settings popover lives inside an .icon-btn-anchor wrapper. The trigger button
-   is rendered by the parent and toggles IsOpen via a two-way binding. *@
+@* Gear trigger only; the panel is rendered at the shell root via SettingsPopoverPanel. *@
 
-<div class="icon-btn-anchor">
-    <button class="icon-btn @(IsOpen ? "is-active" : null)"
-            type="button"
-            title="Playback settings"
-            aria-label="Playback settings"
-            aria-haspopup="true"
-            aria-expanded="@(IsOpen ? "true" : "false")"
-            @onclick="Toggle">
-        <Icon Name="gear-fill" />
-    </button>
-
-    @if (IsOpen)
-    {
-        <div class="app-popover" role="dialog" aria-label="Playback settings"
-             @onclick:stopPropagation="true">
-
-            <div class="app-popover-row">
-                <div class="app-popover-title">Playback</div>
-
-                <label class="form-label" for="settingsSpeed">
-                    Playback speed: @Playback.Settings.PlaybackSpeed.ToString("0.##")x
-                </label>
-                <input id="settingsSpeed"
-                       class="form-range"
-                       type="range"
-                       min="@PlaybackSettings.MinPlaybackSpeed"
-                       max="@PlaybackSettings.MaxPlaybackSpeed"
-                       step="0.25"
-                       value="@Playback.Settings.PlaybackSpeed"
-                       @onchange="SetSpeedAsync" />
-            </div>
-
-            <div class="app-popover-row">
-                <div class="app-popover-title">Slideshow</div>
-
-                @if (Playback.Settings.IsVideoIsolationActive)
-                {
-                    <div class="form-text">
-                        Side panes use independent random durations between
-                        @PlaybackSettings.RandomizedSideImageMinSeconds.ToString("0")&ndash;@PlaybackSettings.RandomizedSideImageMaxSeconds.ToString("0")s
-                        so they don&rsquo;t change in lockstep while the center video plays.
-                    </div>
-                }
-                else
-                {
-                    <label class="form-label" for="settingsImageSeconds">
-                        Image seconds: @Playback.Settings.ImageDurationSeconds.ToString("0")
-                    </label>
-                    <input id="settingsImageSeconds"
-                           class="form-range"
-                           type="range"
-                           min="@PlaybackSettings.MinImageDurationSeconds"
-                           max="@PlaybackSettings.MaxImageDurationSeconds"
-                           step="1"
-                           value="@Playback.Settings.ImageDurationSeconds"
-                           @onchange="SetImageDurationAsync" />
-                }
-
-                <label class="form-label mt-2" for="settingsGifRepeats">
-                    GIF repeats: @Playback.Settings.GifRepeatCount
-                </label>
-                <input id="settingsGifRepeats"
-                       class="form-control form-control-sm"
-                       type="number"
-                       min="@PlaybackSettings.MinGifRepeatCount"
-                       max="@PlaybackSettings.MaxGifRepeatCount"
-                       step="1"
-                       value="@Playback.Settings.GifRepeatCount"
-                       @onchange="SetGifRepeatsAsync" />
-            </div>
-
-            @if (Playback.Settings.SplitScreenMode != SplitScreenMode.Single)
-            {
-                var playlistHasVideo = PlaylistHasVideo();
-
-                <div class="app-popover-row">
-                    <div class="app-popover-title">Split-screen behavior</div>
-
-                    <div class="form-check">
-                        <input id="settingsAlwaysShowVideo"
-                               class="form-check-input"
-                               type="checkbox"
-                               checked="@Playback.Settings.AlwaysShowVideoInSplit"
-                               disabled="@(!playlistHasVideo)"
-                               @onchange="SetAlwaysShowVideoAsync" />
-                        <label class="form-check-label" for="settingsAlwaysShowVideo"
-                               title="@(playlistHasVideo ? null : "Add at least one video to the playlist to enable this option.")">
-                            Always show a video
-                        </label>
-                    </div>
-
-                    @if (Playback.Settings.SplitScreenMode == SplitScreenMode.TriSplit
-                         && Playback.Settings.AlwaysShowVideoInSplit
-                         && playlistHasVideo)
-                    {
-                        <div class="form-check mt-1">
-                            <input id="settingsIsolateVideo"
-                                   class="form-check-input"
-                                   type="checkbox"
-                                   checked="@Playback.Settings.IsolateVideoToCenterPanel"
-                                   @onchange="SetIsolateVideoAsync" />
-                            <label class="form-check-label" for="settingsIsolateVideo">
-                                Isolate video to center pane
-                            </label>
-                        </div>
-                    }
-                </div>
-            }
-
-            <div class="app-popover-row">
-                <div class="app-popover-title">Library</div>
-                <div class="form-check">
-                    <input id="settingsRecursive"
-                           class="form-check-input"
-                           type="checkbox"
-                           checked="@Playback.Settings.RecursiveFolderScan"
-                           @onchange="SetRecursiveAsync" />
-                    <label class="form-check-label" for="settingsRecursive">
-                        Scan folders recursively
-                    </label>
-                </div>
-            </div>
-        </div>
-    }
-</div>
+<button class="icon-btn @(IsOpen ? "is-active" : null)"
+        type="button"
+        title="Playback settings"
+        aria-label="Playback settings"
+        aria-haspopup="true"
+        aria-expanded="@(IsOpen ? "true" : "false")"
+        @onclick="Toggle">
+    <Icon Name="gear-fill" />
+</button>
 
 @code {
     [Parameter] public bool IsOpen { get; set; }
@@ -138,8 +20,6 @@
 
     protected override void OnInitialized()
     {
-        Playback.Changed += OnChanged;
-        Playlist.Changed += OnChanged;
         Popovers.CloseRequested += OnCloseRequested;
     }
 
@@ -147,17 +27,13 @@
     {
         if (!IsOpen)
         {
-            // Close any other popovers (e.g. overflow menu) before opening this one
-            // so the user never sees stacked menus.
             Popovers.CloseAll();
         }
 
         IsOpen = !IsOpen;
-        // Register the aggregate open state with the service so the shell can
-        // suppress native MediaElements while we're up (otherwise the Windows
-        // native overlay paints above this popover and the video appears in
-        // front of the menu).
-        Popovers.SetOpen(this, IsOpen);
+        Popovers.SetSettingsPanelOpen(IsOpen);
+        Popovers.SetOpen(this, IsOpen, suppressNativeVideo: true);
+        await SyncNativeOverlaySuppressionAsync();
         await IsOpenChanged.InvokeAsync(IsOpen);
     }
 
@@ -170,74 +46,22 @@
 
         IsOpen = false;
         Popovers.SetOpen(this, false);
+        Popovers.SetSettingsPanelOpen(false);
         _ = InvokeAsync(async () =>
         {
+            await SyncNativeOverlaySuppressionAsync();
             await IsOpenChanged.InvokeAsync(IsOpen);
             StateHasChanged();
         });
     }
 
-    private bool PlaylistHasVideo()
-    {
-        foreach (var item in Playlist.Items)
-        {
-            if (item.Kind == MediaKind.Video)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private Task SetSpeedAsync(ChangeEventArgs args)
-    {
-        return double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var speed)
-            ? Playback.UpdateSettingsAsync(s => s.PlaybackSpeed = speed)
-            : Task.CompletedTask;
-    }
-
-    private Task SetImageDurationAsync(ChangeEventArgs args)
-    {
-        return double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var seconds)
-            ? Playback.UpdateSettingsAsync(s => s.ImageDurationSeconds = seconds)
-            : Task.CompletedTask;
-    }
-
-    private Task SetGifRepeatsAsync(ChangeEventArgs args)
-    {
-        return int.TryParse(args.Value?.ToString(), out var count)
-            ? Playback.UpdateSettingsAsync(s => s.GifRepeatCount = count)
-            : Task.CompletedTask;
-    }
-
-    private Task SetAlwaysShowVideoAsync(ChangeEventArgs args)
-    {
-        return Playback.UpdateSettingsAsync(s => s.AlwaysShowVideoInSplit = args.Value is bool enabled && enabled);
-    }
-
-    private Task SetIsolateVideoAsync(ChangeEventArgs args)
-    {
-        return Playback.UpdateSettingsAsync(s => s.IsolateVideoToCenterPanel = args.Value is bool enabled && enabled);
-    }
-
-    private Task SetRecursiveAsync(ChangeEventArgs args)
-    {
-        return Playback.UpdateSettingsAsync(s => s.RecursiveFolderScan = args.Value is bool enabled && enabled);
-    }
-
-    private void OnChanged()
-    {
-        _ = InvokeAsync(StateHasChanged);
-    }
+    private Task SyncNativeOverlaySuppressionAsync() =>
+        NativeVideo.SuppressForOverlayAsync(Popovers.AnySuppressesNativeVideo);
 
     public void Dispose()
     {
-        Playback.Changed -= OnChanged;
-        Playlist.Changed -= OnChanged;
         Popovers.CloseRequested -= OnCloseRequested;
-        // Defensively clear our open-state contribution so a disposed component
-        // can't leave the aggregate stuck "open".
         Popovers.SetOpen(this, false);
+        Popovers.SetSettingsPanelOpen(false);
     }
 }

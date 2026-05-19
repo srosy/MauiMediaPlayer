@@ -4,6 +4,9 @@
 @inject MediaSourceService MediaSource
 @inject DebugLogService DebugLog
 @inject NativeVideoPlaybackService NativeVideo
+@inject FavoritesService Favorites
+@inject ToastService Toasts
+@inject IFullscreenService Fullscreen
 @inject IJSRuntime JS
 
 @{
@@ -71,11 +74,13 @@
                        first call to UpdateTransitionTrackingPreRender). *@
                     var prevKind = _previousKindPerSlot.GetValueOrDefault(pane.SlotIndex, MediaKind.Image);
                     var prevWasImageOrGif = prevKind is MediaKind.Image or MediaKind.Gif;
+                    var prevWasVideo = prevKind == MediaKind.Video;
                     if (prevWasImageOrGif && _lastShownImagePerSlot.TryGetValue(pane.SlotIndex, out var videoHoldover))
                     {
-                        <img class="media-image media-image-holdover"
+                        <img @key="@($"vh-{pane.SlotIndex}:{pane.Item.Id}")"
+                             class="media-image media-image-holdover"
                              src="@videoHoldover"
-                             alt="@pane.Item.DisplayName"
+                             alt=""
                              decoding="async" />
                     }
                     else
@@ -85,7 +90,7 @@
                            pane shows its own black background — strictly less jarring
                            than a stale image flash or placeholder text. The MediaElement
                            reveals on top within ~1s. *@
-                        <div class="native-video-placeholder"></div>
+                        <div class="native-video-placeholder @(!prevWasVideo ? "native-video-placeholder--spinner" : null)"></div>
                     }
                 }
                 else if (pane.Item.Kind is MediaKind.Image or MediaKind.Gif)
@@ -99,20 +104,20 @@
                     }
                     else if (_imageSources.TryGetValue(pane.Item.Id, out var imageSource))
                     {
-                        <img class="media-image media-image-ready"
+                        <img @key="@($"ready-{pane.SlotIndex}:{pane.Item.Id}")"
+                             class="media-image media-image-ready"
                              src="@imageSource"
                              alt="@pane.Item.DisplayName"
                              decoding="async"
                              fetchpriority="high" />
                     }
-                    else if (_lastShownImagePerSlot.TryGetValue(pane.SlotIndex, out var holdover))
+                    else if (ShouldShowImageHoldover(pane.SlotIndex)
+                             && _lastShownImagePerSlot.TryGetValue(pane.SlotIndex, out var holdover))
                     {
-                        @* Hold-over: the previous image for THIS slot stays visible while
-                           the new one loads. This eliminates the "Loading image..." flash
-                           that previously appeared on every swap with a cold cache. The
-                           dimmer opacity hints that a transition is in progress without
-                           interrupting the user's view. *@
-                        <img class="media-image media-image-holdover"
+                        @* Hold-over only after image→image/gif: using the slot's last URI
+                           after a video would flash an unrelated still from much earlier. *@
+                        <img @key="@($"ho-{pane.SlotIndex}:{pane.Item.Id}")"
+                             class="media-image media-image-holdover"
                              src="@holdover"
                              alt="@pane.Item.DisplayName"
                              decoding="async" />
@@ -137,6 +142,15 @@
                 <div class="media-caption">
                     <span class="media-caption-title">@pane.Item.DisplayName</span>
                     <span class="media-caption-actions">
+                        <button class="media-favorite-btn @(Favorites.IsFavorite(pane.Item.FilePath) ? "is-favorited" : null)"
+                                type="button"
+                                title="@(Favorites.IsFavorite(pane.Item.FilePath) ? "Remove from favorites" : "Add to favorites")"
+                                aria-label="@(Favorites.IsFavorite(pane.Item.FilePath) ? "Remove from favorites" : "Add to favorites")"
+                                aria-pressed="@(Favorites.IsFavorite(pane.Item.FilePath) ? "true" : "false")"
+                                @onclick="() => ToggleFavoriteAsync(pane.Item)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="@(Favorites.IsFavorite(pane.Item.FilePath) ? "heart-fill" : "heart")" Size="18" />
+                        </button>
                         <span class="media-caption-kind">@pane.Item.Kind</span>
                         <button class="media-skip-btn"
                                 type="button"
@@ -182,6 +196,9 @@
     // indicator flickers. Tracking enter/leave parity gives a stable signal:
     // indicator is visible iff _dragEnterCount > 0.
     private int _dragEnterCount;
+    // Pane assignment key — bounds are re-synced when this changes, not on every
+    // image decode (which was re-positioning native video overlays unnecessarily).
+    private string? _lastBoundsSyncKey;
 
     private IReadOnlyList<VisibleMediaSlot> VisiblePanes => Playback.VisiblePanes;
 
@@ -189,6 +206,20 @@
     {
         Playback.Changed += OnPlaybackChanged;
         Playlist.Changed += OnPlaybackChanged;
+        Favorites.Changed += OnFavoritesChanged;
+        Fullscreen.FullscreenChanged += OnFullscreenChanged;
+    }
+
+    private async Task ToggleFavoriteAsync(MediaItem item)
+    {
+        var added = Favorites.Toggle(item.FilePath);
+        Toasts.Info(added ? $"Added to favorites: {item.DisplayName}" : $"Removed from favorites: {item.DisplayName}");
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void OnFavoritesChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
     }
 
     private Task RequestAddMedia() => OnRequestAddMedia.InvokeAsync();
@@ -264,10 +295,86 @@
             await JS.InvokeVoidAsync("mauiMediaPlayer.observeMediaViewportBounds", _dotNetReference);
         }
 
-        await UpdateNativeVideoBoundsAsync();
+        var boundsSyncKey = BuildBoundsSyncKey(VisiblePanes);
+        if (firstRender || !string.Equals(boundsSyncKey, _lastBoundsSyncKey, StringComparison.Ordinal))
+        {
+            _lastBoundsSyncKey = boundsSyncKey;
+            NativeVideo.RequestLayoutBoundsResync();
+            await UpdateNativeVideoBoundsAsync();
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.ensureMediaPaneObservers");
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+        }
+
         await EnsureImageSourcesAsync();
         UpdateHoldoverState();
         PruneImageCache();
+        await WatchImageElementsAsync();
+    }
+
+    private void OnFullscreenChanged()
+    {
+        _ = RefreshLayoutAfterFullscreenAsync();
+    }
+
+    private async Task RefreshLayoutAfterFullscreenAsync()
+    {
+        try
+        {
+            NativeVideo.RequestLayoutBoundsResync();
+            await InvokeAsync(StateHasChanged);
+
+            // Layout settles over multiple frames after WinUI switches presenters.
+            await FlushNativeBoundsAfterLayoutAsync(0);
+            await FlushNativeBoundsAfterLayoutAsync(80);
+            await FlushNativeBoundsAfterLayoutAsync(200);
+        }
+        catch (Exception exception) when (exception is ObjectDisposedException or InvalidOperationException)
+        {
+            DebugLog.Trace($"Ignored media viewport fullscreen refresh: {exception.Message}");
+        }
+    }
+
+    private async Task FlushNativeBoundsAfterLayoutAsync(int delayMs)
+    {
+        if (delayMs > 0)
+        {
+            await Task.Delay(delayMs);
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.invalidateMediaPaneBoundsCache");
+        }
+        catch (JSDisconnectedException)
+        {
+            return;
+        }
+
+        await UpdateNativeVideoBoundsAsync();
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.requestMediaPaneBoundsFlush");
+            await JS.InvokeVoidAsync("mauiMediaPlayer.ensureMediaPaneObservers");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+    }
+
+    private string BuildBoundsSyncKey(IReadOnlyList<VisibleMediaSlot> panes)
+    {
+        if (panes.Count == 0)
+        {
+            return $"empty:{Playback.Settings.SplitScreenMode}";
+        }
+
+        return $"{Playback.Settings.SplitScreenMode}|{string.Join('|', panes.Select(static pane => $"{pane.SlotIndex}:{pane.Item.Id:N}:{pane.Item.Kind}"))}";
     }
 
     private void UpdateHoldoverState()
@@ -361,6 +468,7 @@
                 // before the render — ensures the very first render after a transition
                 // already sees the correct value.
                 UpdateTransitionTrackingPreRender();
+                SeedVisibleImageSourcesFromCache();
                 StateHasChanged();
             });
         }
@@ -387,7 +495,15 @@
                 // Look up the kind of the item we WERE rendering before this swap.
                 // We can derive it cheaply by remembering only the kind alongside the
                 // id (we don't need the full MediaItem reference).
-                _previousKindPerSlot[pane.SlotIndex] = _lastObservedKindPerSlot.GetValueOrDefault(pane.SlotIndex, MediaKind.Video);
+                var previousKind = _lastObservedKindPerSlot.GetValueOrDefault(pane.SlotIndex, MediaKind.Video);
+                _previousKindPerSlot[pane.SlotIndex] = previousKind;
+
+                // After video (or an unsupported kind), drop the slot holdover URI so a
+                // later image load cannot flash a still from before the video segment.
+                if (previousKind is not (MediaKind.Image or MediaKind.Gif))
+                {
+                    _lastShownImagePerSlot.Remove(pane.SlotIndex);
+                }
             }
 
             _lastObservedItemIdPerSlot[pane.SlotIndex] = pane.Item.Id;
@@ -418,8 +534,33 @@
         }
     }
 
+    private void SeedVisibleImageSourcesFromCache()
+    {
+        foreach (var item in VisiblePanes.Select(static pane => pane.Item).Where(static item => item.Kind is MediaKind.Image or MediaKind.Gif))
+        {
+            if (_imageSources.ContainsKey(item.Id) || _imageErrors.ContainsKey(item.Id))
+            {
+                continue;
+            }
+
+            if (!MediaSource.TryGetCachedDisplayUri(item.Id, out var cachedUri))
+            {
+                continue;
+            }
+
+            _imageSources[item.Id] = cachedUri;
+
+            foreach (var pane in VisiblePanes.Where(p => p.Item.Id == item.Id))
+            {
+                _lastShownImagePerSlot[pane.SlotIndex] = cachedUri;
+            }
+        }
+    }
+
     private async Task EnsureImageSourcesAsync()
     {
+        SeedVisibleImageSourcesFromCache();
+
         foreach (var item in VisiblePanes.Select(static pane => pane.Item).Where(static item => item.Kind is MediaKind.Image or MediaKind.Gif))
         {
             if (_imageSources.ContainsKey(item.Id) || _imageErrors.ContainsKey(item.Id) || !_loadingImageIds.Add(item.Id))
@@ -439,7 +580,25 @@
     {
         try
         {
-            var imageSource = await MediaSource.GetImageDataUriAsync(item);
+            var thumbnail = await MediaSource.GetThumbnailDataUriAsync(item);
+
+            if (IsVisibleItem(item.Id))
+            {
+                foreach (var pane in VisiblePanes.Where(p => p.Item.Id == item.Id))
+                {
+                    _lastShownImagePerSlot[pane.SlotIndex] = thumbnail;
+                }
+
+                if (!_imageSources.ContainsKey(item.Id))
+                {
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+
+            var wasCached = MediaSource.TryGetCachedDisplayUri(item.Id, out var cachedUri);
+            var imageSource = wasCached
+                ? cachedUri
+                : await MediaSource.GetImageDataUriAsync(item);
 
             if (!IsVisibleItem(item.Id))
             {
@@ -447,25 +606,18 @@
                 return;
             }
 
-            // Phase 4: ask the WebView to decode this URI into its internal image cache
-            // off the main thread BEFORE we attach a real <img> to the DOM. With the
-            // hold-over rendering the previous image during this short window, the user
-            // sees zero "decode hitch" when the <img> swaps in. Best-effort: a failure
-            // or timeout silently proceeds with the attach.
-            await PrewarmInWebViewAsync(imageSource, item.DisplayName);
-
-            if (!IsVisibleItem(item.Id))
+            if (!wasCached)
             {
-                DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; pane changed during prewarm.");
-                return;
+                await PrewarmInWebViewAsync(imageSource, item.DisplayName);
+
+                if (!IsVisibleItem(item.Id))
+                {
+                    DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; pane changed during prewarm.");
+                    return;
+                }
             }
 
-            await InvokeAsync(() =>
-            {
-                _imageSources[item.Id] = imageSource;
-                StateHasChanged();
-            });
-            DebugLog.Info($"Image source ready: {item.DisplayName}.");
+            await AttachImageSourceAsync(item, imageSource);
         }
         catch (Exception exception)
         {
@@ -488,8 +640,29 @@
         }
     }
 
+    private async Task AttachImageSourceAsync(MediaItem item, string imageSource)
+    {
+        await InvokeAsync(() =>
+        {
+            _imageSources[item.Id] = imageSource;
+
+            foreach (var pane in VisiblePanes.Where(p => p.Item.Id == item.Id))
+            {
+                _lastShownImagePerSlot[pane.SlotIndex] = imageSource;
+            }
+
+            StateHasChanged();
+        });
+        DebugLog.Info($"Image source ready: {item.DisplayName}.");
+    }
+
     private async Task PrewarmInWebViewAsync(string dataUri, string displayName)
     {
+        if (dataUri.Length > 4_000_000)
+        {
+            return;
+        }
+
         try
         {
             var prewarmed = await JS.InvokeAsync<bool>("mauiMediaPlayer.prewarmImage", dataUri, 3000)
@@ -515,6 +688,9 @@
     {
         return VisiblePanes.Any(pane => pane.Item.Id == itemId);
     }
+
+    private bool ShouldShowImageHoldover(int slotIndex) =>
+        _previousKindPerSlot.GetValueOrDefault(slotIndex) is MediaKind.Image or MediaKind.Gif;
 
     private void PruneImageCache()
     {
@@ -562,10 +738,29 @@
         public double Height { get; set; }
     }
 
+    private async Task WatchImageElementsAsync()
+    {
+        if (_dotNetReference is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.watchImages", _dotNetReference);
+        }
+        catch (Exception exception) when (exception is JSDisconnectedException or InvalidOperationException)
+        {
+            DebugLog.Trace($"Could not watch image elements: {exception.GetType().Name}.");
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         Playback.Changed -= OnPlaybackChanged;
         Playlist.Changed -= OnPlaybackChanged;
+        Favorites.Changed -= OnFavoritesChanged;
+        Fullscreen.FullscreenChanged -= OnFullscreenChanged;
 
         try
         {

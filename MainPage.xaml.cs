@@ -1,5 +1,11 @@
 using MauiMediaPlayer.Services;
 using MauiMediaPlayer.Models;
+#if WINDOWS
+using MauiMediaPlayer.Platforms.Windows;
+using Microsoft.UI.Xaml;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Storage;
+#endif
 
 namespace MauiMediaPlayer;
 
@@ -10,6 +16,7 @@ public partial class MainPage : ContentPage
 	private readonly PlaybackService _playback;
 	private readonly IFullscreenService _fullscreen;
 	private readonly DebugLogService _debugLog;
+	private readonly FullPathDropService _fullPathDrop;
 	private CancellationTokenSource? _nativeTapCancellation;
 	private int _nativeTapCount;
 
@@ -17,13 +24,18 @@ public partial class MainPage : ContentPage
 		NativeVideoPlaybackService nativeVideoPlayback,
 		PlaybackService playback,
 		IFullscreenService fullscreen,
-		DebugLogService debugLog)
+		DebugLogService debugLog,
+		FullPathDropService fullPathDrop)
 	{
 		_nativeVideoPlayback = nativeVideoPlayback;
 		_playback = playback;
 		_fullscreen = fullscreen;
 		_debugLog = debugLog;
+		_fullPathDrop = fullPathDrop;
 		InitializeComponent();
+#if WINDOWS
+		Loaded += OnPageLoadedForWindowsDrop;
+#endif
 		nativeVideoElement0.Loaded += OnNativeVideoElementLoaded;
 		nativeVideoElement1.Loaded += OnNativeVideoElementLoaded;
 		nativeVideoElement2.Loaded += OnNativeVideoElementLoaded;
@@ -122,4 +134,50 @@ public partial class MainPage : ContentPage
 			await _playback.PlayAsync();
 		}
 	}
+
+#if WINDOWS
+	private void OnPageLoadedForWindowsDrop(object? sender, EventArgs e)
+	{
+		Loaded -= OnPageLoadedForWindowsDrop;
+
+		if (Handler?.PlatformView is not FrameworkElement element)
+		{
+			return;
+		}
+
+		element.AllowDrop = true;
+		element.DragOver += OnWindowsDragOver;
+		element.Drop += OnWindowsDrop;
+	}
+
+	private static void OnWindowsDragOver(object sender, Microsoft.UI.Xaml.DragEventArgs args)
+	{
+		if (args.DataView.Contains(StandardDataFormats.StorageItems))
+		{
+			args.AcceptedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+		}
+
+		args.Handled = true;
+	}
+
+	private async void OnWindowsDrop(object sender, Microsoft.UI.Xaml.DragEventArgs args)
+	{
+		if (!args.DataView.Contains(StandardDataFormats.StorageItems))
+		{
+			return;
+		}
+
+		var items = await args.DataView.GetStorageItemsAsync();
+		var paths = items
+			.OfType<StorageFile>()
+			.Select(static file => file.Path)
+			.Where(static path => !string.IsNullOrWhiteSpace(path))
+			.ToArray();
+
+		if (paths.Length > 0)
+		{
+			await _fullPathDrop.NotifyPathsDroppedAsync(paths);
+		}
+	}
+#endif
 }

@@ -1,4 +1,7 @@
 using MauiMediaPlayer.Models;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Processing;
 
 namespace MauiMediaPlayer.Services;
 
@@ -14,14 +17,70 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
     private const long MaxCacheByteBudget = 64L * 1024 * 1024;
     private const long MaxIndividualEntryBytes = 20L * 1024 * 1024;
     private const int MaxPrefetchConcurrency = 2;
+    private const long ThumbnailGenerationThresholdBytes = 1536L * 1024;
+    private const int ThumbnailMaxEdgePixels = 1080;
 
     private readonly Dictionary<Guid, LinkedListNode<CacheEntry>> _cacheMap = [];
+    private readonly Dictionary<Guid, LinkedListNode<CacheEntry>> _thumbnailCacheMap = [];
+    private readonly LinkedList<CacheEntry> _thumbnailLruOrder = new();
     private readonly LinkedList<CacheEntry> _lruOrder = new();
     private readonly object _cacheLock = new();
     private readonly Dictionary<Guid, Task<string?>> _inFlightLoads = [];
     private readonly SemaphoreSlim _prefetchGate = new(MaxPrefetchConcurrency, MaxPrefetchConcurrency);
     private long _cachedBytes;
+    private long _thumbnailCachedBytes;
     private bool _disposed;
+
+    public async Task<string> GetThumbnailDataUriAsync(MediaItem item, CancellationToken cancellationToken = default)
+    {
+        if (item.Kind is not (MediaKind.Image or MediaKind.Gif))
+        {
+            return await GetImageDataUriAsync(item, cancellationToken);
+        }
+
+        if (TryGetCachedThumbnail(item.Id, out var cachedThumb))
+        {
+            return cachedThumb;
+        }
+
+        if (item.SizeBytes <= ThumbnailGenerationThresholdBytes)
+        {
+            return await GetImageDataUriAsync(item, cancellationToken);
+        }
+
+        var thumbUri = await LoadThumbnailDataUriAsync(item, cancellationToken);
+        return thumbUri ?? await GetImageDataUriAsync(item, cancellationToken);
+    }
+
+    public async Task PrefetchThumbnailAsync(MediaItem item, CancellationToken cancellationToken = default)
+    {
+        if (item.Kind is not (MediaKind.Image or MediaKind.Gif))
+        {
+            return;
+        }
+
+        if (TryGetCachedThumbnail(item.Id, out _))
+        {
+            return;
+        }
+
+        try
+        {
+            await _prefetchGate.WaitAsync(cancellationToken);
+            _ = await GetThumbnailDataUriAsync(item, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            debugLog.Trace($"Thumbnail prefetch failed for {item.DisplayName}: {exception.Message}");
+        }
+        finally
+        {
+            _prefetchGate.Release();
+        }
+    }
 
     public async Task<string> GetImageDataUriAsync(MediaItem item, CancellationToken cancellationToken = default)
     {
@@ -29,6 +88,16 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
         {
             debugLog.Trace($"Image cache hit: {item.DisplayName} ({item.SizeBytes:N0} bytes); cachedBytes={_cachedBytes:N0}.");
             return cached;
+        }
+
+        // Do not use file:// URIs for <img> in the Blazor WebView — the host page uses a
+        // virtual https origin, so local file URLs fail to paint even though we can cache them.
+        // (IImageDisplayUriProvider remains available for a future custom-scheme path.)
+
+        if (item.SizeBytes > MaxIndividualEntryBytes)
+        {
+            debugLog.Debug($"Oversized image using thumbnail for display: {item.DisplayName}; size={item.SizeBytes:N0}; ceiling={MaxIndividualEntryBytes:N0}.");
+            return await GetThumbnailDataUriAsync(item, cancellationToken);
         }
 
         var dataUri = await LoadOrJoinInFlightAsync(item, cancellationToken);
@@ -109,6 +178,13 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
                 _cacheMap.Remove(itemId);
                 debugLog.Trace($"Image cache evict (invalidate): id={itemId}; cachedBytes={_cachedBytes:N0}.");
             }
+
+            if (_thumbnailCacheMap.TryGetValue(itemId, out var thumbNode))
+            {
+                _thumbnailCachedBytes -= thumbNode.Value.Bytes;
+                _thumbnailLruOrder.Remove(thumbNode);
+                _thumbnailCacheMap.Remove(itemId);
+            }
         }
     }
 
@@ -124,7 +200,7 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
 
         lock (_cacheLock)
         {
-            if (_cacheMap.Count == 0)
+            if (_cacheMap.Count == 0 && _thumbnailCacheMap.Count == 0)
             {
                 return;
             }
@@ -147,9 +223,25 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
                 }
             }
 
+            foreach (var key in _thumbnailCacheMap.Keys.ToArray())
+            {
+                if (liveItemIds.Contains(key))
+                {
+                    continue;
+                }
+
+                if (_thumbnailCacheMap.TryGetValue(key, out var thumbNode))
+                {
+                    _thumbnailCachedBytes -= thumbNode.Value.Bytes;
+                    _thumbnailLruOrder.Remove(thumbNode);
+                    _thumbnailCacheMap.Remove(key);
+                    evicted++;
+                }
+            }
+
             if (evicted > 0)
             {
-                debugLog.Debug($"Image cache pruned to live playlist: evicted={evicted}; cachedBytes={_cachedBytes:N0}.");
+                debugLog.Debug($"Image cache pruned to live playlist: evicted={evicted}; cachedBytes={_cachedBytes:N0}; thumbCachedBytes={_thumbnailCachedBytes:N0}.");
             }
         }
     }
@@ -170,6 +262,20 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
         }
     }
 
+    /// <summary>
+    /// Returns a cached full-size or thumbnail data URI when available (synchronous).
+    /// Used to paint image panes on the first frame after a swap without a loading state.
+    /// </summary>
+    public bool TryGetCachedDisplayUri(Guid itemId, out string dataUri)
+    {
+        if (TryGetCachedDataUri(itemId, out dataUri))
+        {
+            return true;
+        }
+
+        return TryGetCachedThumbnail(itemId, out dataUri);
+    }
+
     private bool TryGetCachedDataUri(Guid itemId, out string dataUri)
     {
         lock (_cacheLock)
@@ -185,6 +291,87 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
 
         dataUri = string.Empty;
         return false;
+    }
+
+    private bool TryGetCachedThumbnail(Guid itemId, out string dataUri)
+    {
+        lock (_cacheLock)
+        {
+            if (_thumbnailCacheMap.TryGetValue(itemId, out var node))
+            {
+                _thumbnailLruOrder.Remove(node);
+                _thumbnailLruOrder.AddFirst(node);
+                dataUri = node.Value.DataUri;
+                return true;
+            }
+        }
+
+        dataUri = string.Empty;
+        return false;
+    }
+
+    private async Task<string?> LoadThumbnailDataUriAsync(MediaItem item, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var dataUri = await Task.Run(() => GenerateThumbnailDataUri(item), cancellationToken);
+            var memoryFootprintBytes = (long)dataUri.Length * sizeof(char);
+            AddToThumbnailCache(item.Id, dataUri, memoryFootprintBytes);
+            debugLog.Debug($"Thumbnail created for {item.DisplayName}; memory={memoryFootprintBytes:N0}.");
+            return dataUri;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            debugLog.Trace($"Thumbnail generation failed for {item.DisplayName}: {exception.Message}");
+            return null;
+        }
+    }
+
+    private static string GenerateThumbnailDataUri(MediaItem item)
+    {
+        using var stream = OpenSharedReadStream(item.FilePath);
+        using var image = SixLabors.ImageSharp.Image.Load(stream);
+        image.Mutate(ctx => ctx.AutoOrient());
+
+        var maxEdge = Math.Max(image.Width, image.Height);
+
+        if (maxEdge > ThumbnailMaxEdgePixels)
+        {
+            var scale = ThumbnailMaxEdgePixels / (double)maxEdge;
+            var width = Math.Max(1, (int)Math.Round(image.Width * scale));
+            var height = Math.Max(1, (int)Math.Round(image.Height * scale));
+            image.Mutate(ctx => ctx.Resize(width, height));
+        }
+
+        using var output = new MemoryStream();
+        image.Save(output, new JpegEncoder { Quality = 82 });
+        var base64 = Convert.ToBase64String(output.ToArray());
+        return $"data:image/jpeg;base64,{base64}";
+    }
+
+    private void AddToThumbnailCache(Guid itemId, string dataUri, long byteWeight)
+    {
+        lock (_cacheLock)
+        {
+            if (_thumbnailCacheMap.TryGetValue(itemId, out var existing))
+            {
+                _thumbnailCachedBytes -= existing.Value.Bytes;
+                _thumbnailLruOrder.Remove(existing);
+                _thumbnailCacheMap.Remove(itemId);
+            }
+
+            var node = new LinkedListNode<CacheEntry>(new CacheEntry(itemId, dataUri, byteWeight));
+            _thumbnailLruOrder.AddFirst(node);
+            _thumbnailCacheMap[itemId] = node;
+            _thumbnailCachedBytes += byteWeight;
+
+            while (_thumbnailCachedBytes > MaxCacheByteBudget / 4 && _thumbnailLruOrder.Last is { } tail)
+            {
+                _thumbnailCachedBytes -= tail.Value.Bytes;
+                _thumbnailCacheMap.Remove(tail.Value.ItemId);
+                _thumbnailLruOrder.RemoveLast();
+            }
+        }
     }
 
     private Task<string?> LoadOrJoinInFlightAsync(MediaItem item, CancellationToken cancellationToken)
@@ -241,7 +428,7 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
     {
         debugLog.Trace($"Reading {item.Kind} bytes for display: {item.DisplayName} ({item.SizeBytes:N0} bytes).");
 
-        var bytes = await File.ReadAllBytesAsync(item.FilePath, cancellationToken);
+        var bytes = await ReadSharedFileBytesAsync(item.FilePath, cancellationToken);
         var mimeType = GetImageMimeType(item.Extension);
         var base64 = Convert.ToBase64String(bytes);
         var dataUri = $"data:{mimeType};base64,{base64}";
@@ -311,7 +498,7 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
             var duration = await Task.Run(() =>
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                using var stream = File.OpenRead(item.FilePath);
+                using var stream = OpenSharedReadStream(item.FilePath);
                 return GetGifAnimationDuration(stream);
             }, cancellationToken);
 
@@ -331,6 +518,25 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
             debugLog.Error($"Could not read GIF duration for {item.DisplayName}: {exception.Message}");
             return null;
         }
+    }
+
+    private static async Task<byte[]> ReadSharedFileBytesAsync(string filePath, CancellationToken cancellationToken)
+    {
+        await using var stream = OpenSharedReadStream(filePath);
+        using var memory = new MemoryStream();
+        await stream.CopyToAsync(memory, cancellationToken);
+        return memory.ToArray();
+    }
+
+    private static FileStream OpenSharedReadStream(string filePath)
+    {
+        return new FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 4096,
+            options: FileOptions.Asynchronous | FileOptions.SequentialScan);
     }
 
     private static TimeSpan? GetGifAnimationDuration(Stream stream)

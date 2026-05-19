@@ -14,6 +14,7 @@
 
 /* ----- 1. THEME TOKENS ----- */
 :root {
+    --popover-surface: #FFFFFF;
     --brand: #7C3AED;
     --brand-hover: #6D28D9;
     --brand-soft: rgba(124, 58, 237, 0.18);
@@ -47,6 +48,8 @@
     --bs-body-color-rgb: 229, 231, 235;
     --bs-secondary-color: rgba(229, 231, 235, 0.72);
     --bs-tertiary-color: rgba(229, 231, 235, 0.52);
+    /* Fully opaque popover surface (no alpha) so native video cannot bleed through. */
+    --popover-surface: #1B2029;
 }
 
 html, body {
@@ -470,17 +473,89 @@ h1:focus {
 }
 
 .app-popover {
-    background: var(--bs-secondary-bg);
+    background-color: var(--popover-surface);
+    background-image: none;
     border: 1px solid var(--bs-border-color);
     border-radius: var(--radius-md);
-    box-shadow: var(--shadow-elev-2);
+    box-shadow: var(--shadow-elev-3);
     bottom: calc(100% + 0.5rem);
     color: var(--bs-body-color);
+    isolation: isolate;
     min-width: 22rem;
+    opacity: 1;
     padding: 1rem;
     position: absolute;
     right: 0;
-    z-index: 20;
+    z-index: 200;
+}
+
+/* Shell-level overlay host: settings panel stacks above media captions and transport. */
+.player-overlay-stack {
+    inset: 0;
+    pointer-events: none;
+    position: fixed;
+    z-index: 20000;
+}
+
+.player-overlay-stack > .app-popover-settings {
+    pointer-events: auto;
+}
+
+.player-shell.is-settings-open .media-caption {
+    pointer-events: none;
+    visibility: hidden;
+}
+
+/* Settings: fixed above the transport bar, shifted over the playlist column when visible. */
+.app-popover-settings {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    bottom: 5.5rem;
+    box-shadow: var(--shadow-elev-3), 0 0 0 1px var(--bs-border-color);
+    left: auto;
+    max-height: min(32rem, calc(100vh - 7.5rem));
+    overflow-x: hidden;
+    overflow-y: auto;
+    position: fixed;
+    right: 0.75rem;
+    width: min(22rem, calc(100vw - 1.5rem));
+    z-index: 1;
+}
+
+.player-shell.has-visible-playlist .app-popover-settings {
+    right: calc(min(22rem, max(18rem, 22vw)) + 0.75rem);
+}
+
+.app-popover-settings::before {
+    background-color: var(--popover-surface);
+    border-radius: inherit;
+    content: "";
+    inset: 0;
+    pointer-events: none;
+    position: absolute;
+    z-index: -1;
+}
+
+.app-popover-settings > * {
+    position: relative;
+    z-index: 1;
+}
+
+.app-popover .form-control,
+.app-popover .form-select {
+    background-color: var(--bs-body-bg);
+    border-color: var(--bs-border-color);
+    color: var(--bs-body-color);
+}
+
+.app-popover .form-check-input {
+    background-color: var(--bs-tertiary-bg);
+    border-color: var(--bs-border-color);
+}
+
+.app-popover .form-check-input:checked {
+    background-color: var(--brand);
+    border-color: var(--brand);
 }
 
 .app-popover-title {
@@ -512,6 +587,12 @@ h1:focus {
 .app-popover-menu {
     min-width: 13rem;
     padding: 0.375rem;
+}
+
+/* Header overflow opens downward; default .app-popover opens upward for transport-bar settings. */
+.app-popover-below {
+    bottom: auto;
+    top: calc(100% + 0.5rem);
 }
 
 .app-popover-menu .menu-item {
@@ -710,6 +791,13 @@ h1:focus {
     outline-offset: -2px;
 }
 
+.playlist-item-favorite {
+    align-items: center;
+    color: var(--brand, #e74c3c);
+    display: flex;
+    flex: 0 0 auto;
+}
+
 .playlist-item-icon {
     align-items: center;
     background: var(--bs-tertiary-bg);
@@ -822,16 +910,38 @@ h1:focus {
     width: 100%;
 }
 
-.media-image-holdover,
+.media-image-holdover {
+    opacity: 1;
+}
+
 .media-image-ready {
     opacity: 1;
-    transition: opacity var(--transition-fast);
 }
 
 .native-video-placeholder {
     background: #000;
     height: 100%;
+    position: relative;
     width: 100%;
+}
+
+.native-video-placeholder--spinner::after {
+    animation: native-video-loading-pulse 1.2s ease-in-out infinite;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-radius: 50%;
+    border-top-color: rgba(255, 255, 255, 0.75);
+    content: "";
+    height: 28px;
+    left: 50%;
+    position: absolute;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 28px;
+}
+
+@keyframes native-video-loading-pulse {
+    from { transform: translate(-50%, -50%) rotate(0deg); }
+    to { transform: translate(-50%, -50%) rotate(360deg); }
 }
 
 /* Video panes: clip HTML "underlay" content (holdover image, placeholder div)
@@ -898,6 +1008,7 @@ h1:focus {
     gap: 0.625rem;
     justify-content: space-between;
     left: 0;
+    min-height: 2.75rem;
     padding: 1.5rem 0.75rem 0.5rem;
     position: absolute;
     right: 0;
@@ -927,6 +1038,42 @@ h1:focus {
     letter-spacing: 0.04em;
     padding: 0.1rem 0.45rem;
     text-transform: uppercase;
+}
+
+.media-favorite-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    display: inline-flex;
+    flex-shrink: 0;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+    width: 26px;
+}
+
+.media-favorite-btn .bi {
+    display: block;
+    flex-shrink: 0;
+}
+
+.media-favorite-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+}
+
+.media-favorite-btn.is-favorited {
+    background: var(--brand-soft);
+    color: var(--brand);
+}
+
+.media-favorite-btn.is-favorited:hover {
+    background: var(--brand);
+    color: #fff;
 }
 
 .media-skip-btn {
@@ -1279,6 +1426,10 @@ h1:focus {
 }
 
 /* ----- 10. FULLSCREEN + RESPONSIVE ----- */
+.is-fullscreen.player-shell {
+    grid-template-rows: 1fr;
+}
+
 .is-fullscreen .player-header,
 .is-fullscreen .transport-bar,
 .is-fullscreen .debug-footer,

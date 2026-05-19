@@ -1,5 +1,8 @@
 using MauiMediaPlayer.Services;
 using Microsoft.Extensions.DependencyInjection;
+#if WINDOWS
+using MauiMediaPlayer.Platforms.Windows;
+#endif
 
 namespace MauiMediaPlayer;
 
@@ -50,6 +53,25 @@ public partial class App : Application
 		{
 			titleService.TitleChanged -= HandleTitleChanged;
 		};
+
+#if WINDOWS
+		var systemMediaTransport = _serviceProvider.GetRequiredService<WindowsSystemMediaTransportService>();
+
+		void TryInitializeSystemMediaTransport()
+		{
+			_ = systemMediaTransport.TryInitialize();
+		}
+
+		window.HandlerChanged += (_, _) =>
+		{
+			if (window.Handler is not null)
+			{
+				TryInitializeSystemMediaTransport();
+			}
+		};
+
+		window.Activated += (_, _) => TryInitializeSystemMediaTransport();
+#endif
 
 		return window;
 	}

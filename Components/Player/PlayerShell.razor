@@ -9,9 +9,10 @@
 @inject ToastService Toasts
 @inject WindowTitleService WindowTitle
 @inject PopoverStateService Popovers
+@inject FullPathDropService FullPathDrop
 @inject IJSRuntime JS
 
-<div class="player-shell @(Fullscreen.IsFullscreen ? "is-fullscreen" : null) @(_compactMode ? "is-compact" : null)"
+<div class="player-shell @(Fullscreen.IsFullscreen ? "is-fullscreen" : null) @(_compactMode ? "is-compact" : null) @(Popovers.SettingsPanelOpen ? "is-settings-open" : null) @(!IsPlaylistHidden ? "has-visible-playlist" : null)"
      data-player-root
      tabindex="0"
      @onkeydown="HandleKeyDown">
@@ -67,7 +68,7 @@
 
                 @if (_overflowOpen)
                 {
-                    <div class="app-popover app-popover-menu" role="menu"
+                    <div class="app-popover app-popover-menu app-popover-below" role="menu"
                          @onclick:stopPropagation="true">
                         <button class="menu-item" type="button" role="menuitem" @onclick="ToggleThemeAsync">
                             <Icon Name="@(_theme == "dark" ? "sun-fill" : "moon-stars-fill")" Size="14" />
@@ -104,7 +105,7 @@
         <div class="player-main">
             <MediaViewport OnRequestAddMedia="OpenAddMediaDialog"
                            OnDroppedPaths="OnFilesDroppedAsync" />
-            <PlaybackControls />
+            <PlaybackControls IsCompactMode="_compactMode" OnExitCompact="ExitCompactFromTransportAsync" />
         </div>
 
         <PlaylistPanel @bind-IsCollapsed="_playlistCollapsed"
@@ -114,6 +115,13 @@
     <DebugLogFooter />
 
     <ToastHost />
+
+    @if (Popovers.SettingsPanelOpen)
+    {
+        <div class="player-overlay-stack">
+            <SettingsPopoverPanel />
+        </div>
+    }
 
     @* Routing through explicit IsOpenChanged callbacks (instead of @bind-IsOpen)
        lets us hook overlay suppression on close — the modal's own Close()/Escape
@@ -217,16 +225,20 @@
     private readonly List<string> _pendingPaths = [];
     private DotNetObjectReference<PlayerShell>? _dotNetReference;
     private string? _lastSignaledNowPlayingTitle;
+    private string? _lastLibraryFolder;
+    private int _lastPersistedResumeIndex = -1;
 
     private bool IsPlaylistHidden => _playlistCollapsed || _compactMode;
 
     protected override async Task OnInitializedAsync()
     {
-        Playlist.Changed += OnStateChanged;
+        Playlist.Changed += OnPlaylistChanged;
         Playback.Changed += OnPlaybackChanged;
+        FullPathDrop.PathsDropped += OnFullPathsDroppedAsync;
         Fullscreen.FullscreenChanged += OnStateChanged;
         Popovers.CloseRequested += OnPopoversCloseRequested;
         Popovers.AnyOpenChanged += OnPopoverAnyOpenChanged;
+        Popovers.SettingsPanelOpenChanged += OnSettingsPanelOpenChanged;
 
         // UI preferences (theme, collapse, compact) load synchronously and apply
         // before the first paint so users don't see a flash from the defaults.
@@ -236,6 +248,13 @@
 
         await Playback.InitializeAsync();
         DebugLog.Add("Application initialized.");
+        LogUiConfiguration("application-initialized");
+    }
+
+    private void LogUiConfiguration(string reason)
+    {
+        DebugLog.Debug(
+            $"UI configuration ({reason}). theme={_theme}; compactMode={_compactMode}; playlistCollapsed={_playlistCollapsed}; playlistHidden={IsPlaylistHidden}; fullscreenSupported={Fullscreen.IsSupported}; fullscreenActive={Fullscreen.IsFullscreen}.");
     }
 
     private void OnPopoversCloseRequested()
@@ -261,6 +280,11 @@
         // marshaled opacity/bounds toggle).
         _ = anyOpen;
         _ = SyncOverlaySuppressionAsync();
+    }
+
+    private void OnSettingsPanelOpenChanged()
+    {
+        _ = InvokeAsync(StateHasChanged);
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -331,10 +355,7 @@
         _showAddMediaDialog = true;
         _shortcutsOpen = false;
         _aboutOpen = false;
-        _overflowOpen = false;
-        // Clear our own contribution to the popover-state aggregate before
-        // CloseAll, so an outstanding overflow registration is properly removed.
-        Popovers.SetOpen(this, false);
+        CloseOverflowMenu();
         Popovers.CloseAll();
         await SyncOverlaySuppressionAsync();
     }
@@ -408,6 +429,7 @@
         try
         {
             DebugLog.Add($"Loading {paths.Length} path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
+            _lastLibraryFolder = ResolveLibraryRoot(paths);
             var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
             var loadedAny = await AddScanResultAsync(result, "media");
 
@@ -436,6 +458,18 @@
         if (result.Items.Count > 0)
         {
             Playlist.AddItems(result.Items);
+
+            if (_lastLibraryFolder is not null)
+            {
+                var resumeIndex = await SettingsService.GetLibraryResumeIndexAsync(_lastLibraryFolder);
+
+                if (resumeIndex is int index && index >= 0 && index < Playlist.Items.Count)
+                {
+                    Playlist.SetCurrentIndex(index);
+                    DebugLog.Debug($"Restored library position {index + 1} for {_lastLibraryFolder}.");
+                }
+            }
+
             var skipped = result.SkippedFiles.Count;
             var skipPart = skipped > 0 ? $" (skipped {skipped} unsupported)" : "";
             Toasts.Success($"Added {result.Items.Count} item{(result.Items.Count == 1 ? "" : "s")} from {sourceDescription}{skipPart}.");
@@ -491,6 +525,7 @@
         try
         {
             DebugLog.Add($"Auto-loading {paths.Length} saved media path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
+            _lastLibraryFolder = ResolveLibraryRoot(paths);
             var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
             await AddScanResultAsync(result, "last known location");
         }
@@ -518,6 +553,7 @@
     {
         _playlistCollapsed = !_playlistCollapsed;
         Preferences.Default.Set(PlaylistCollapsedPrefKey, _playlistCollapsed);
+        LogUiConfiguration("playlist-toggled");
         await Task.CompletedTask;
     }
 
@@ -533,7 +569,10 @@
         _overflowOpen = !_overflowOpen;
         // Register with the popover service so AnyOpenChanged fires and the shell
         // suppresses native video overlays while the overflow menu is up.
-        Popovers.SetOpen(this, _overflowOpen);
+        // Header overflow sits above the viewport; suppressing native video here
+        // only hid playing panes behind a loading spinner without helping the menu.
+        Popovers.SetOpen(this, _overflowOpen, suppressNativeVideo: false);
+        _ = SyncOverlaySuppressionAsync();
     }
 
     // Closes the overflow menu and keeps the popover service in sync. Use this
@@ -543,11 +582,7 @@
     // suppression in the "on" state.
     private void CloseOverflowMenu()
     {
-        if (_overflowOpen)
-        {
-            _overflowOpen = false;
-        }
-
+        _overflowOpen = false;
         Popovers.SetOpen(this, false);
     }
 
@@ -558,8 +593,7 @@
         _shortcutsOpen = true;
         _aboutOpen = false;
         _showAddMediaDialog = false;
-        _overflowOpen = false;
-        Popovers.SetOpen(this, false);
+        CloseOverflowMenu();
         Popovers.CloseAll();
         await SyncOverlaySuppressionAsync();
     }
@@ -569,8 +603,7 @@
         _aboutOpen = true;
         _shortcutsOpen = false;
         _showAddMediaDialog = false;
-        _overflowOpen = false;
-        Popovers.SetOpen(this, false);
+        CloseOverflowMenu();
         Popovers.CloseAll();
         await SyncOverlaySuppressionAsync();
     }
@@ -587,7 +620,7 @@
         var anyOverlayOpen = _shortcutsOpen
             || _aboutOpen
             || _showAddMediaDialog
-            || Popovers.AnyOpen;
+            || Popovers.AnySuppressesNativeVideo;
         return NativeVideo.SuppressForOverlayAsync(anyOverlayOpen);
     }
 
@@ -608,6 +641,7 @@
         _theme = _theme == "dark" ? "light" : "dark";
         Preferences.Default.Set(ThemePrefKey, _theme);
         CloseOverflowMenu();
+        LogUiConfiguration("theme-changed");
         await ApplyThemeAsync();
     }
 
@@ -616,7 +650,21 @@
         _compactMode = !_compactMode;
         Preferences.Default.Set(CompactModePrefKey, _compactMode);
         CloseOverflowMenu();
-        await Task.CompletedTask;
+        LogUiConfiguration("compact-mode-toggled");
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ExitCompactFromTransportAsync()
+    {
+        if (!_compactMode)
+        {
+            return;
+        }
+
+        _compactMode = false;
+        Preferences.Default.Set(CompactModePrefKey, false);
+        LogUiConfiguration("compact-mode-exited");
+        await InvokeAsync(StateHasChanged);
     }
 
     private Task SetRecursiveAsync(ChangeEventArgs args) =>
@@ -660,11 +708,19 @@
                 break;
 
             case "escape":
-                if (_overflowOpen) { _overflowOpen = false; Popovers.CloseAll(); break; }
+                if (_overflowOpen)
+                {
+                    CloseOverflowMenu();
+                    Popovers.CloseAll();
+                    await SyncOverlaySuppressionAsync();
+                    await InvokeAsync(StateHasChanged);
+                    break;
+                }
                 if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); break; }
                 if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); break; }
                 if (_showAddMediaDialog) { await CloseAddMediaDialog(); break; }
                 Popovers.CloseAll();
+                await SyncOverlaySuppressionAsync();
                 if (Fullscreen.IsSupported)
                 {
                     await Fullscreen.ExitAsync();
@@ -683,6 +739,10 @@
             case "m":
                 await Playback.UpdateSettingsAsync(settings => settings.Muted = !settings.Muted);
                 break;
+
+            case "c":
+                await ToggleCompactAsync();
+                break;
         }
     }
 
@@ -694,11 +754,19 @@
             case "exitFullscreen":
                 // Modals/overlays consume Escape first, so the fullscreen toggle
                 // only fires once they're all closed.
-                if (_overflowOpen) { _overflowOpen = false; Popovers.CloseAll(); await InvokeAsync(StateHasChanged); break; }
+                if (_overflowOpen)
+                {
+                    CloseOverflowMenu();
+                    Popovers.CloseAll();
+                    await SyncOverlaySuppressionAsync();
+                    await InvokeAsync(StateHasChanged);
+                    break;
+                }
                 if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
                 if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
                 if (_showAddMediaDialog) { await CloseAddMediaDialog(); await InvokeAsync(StateHasChanged); break; }
                 Popovers.CloseAll();
+                await SyncOverlaySuppressionAsync();
 
                 if (Fullscreen.IsSupported)
                 {
@@ -728,19 +796,68 @@
                 await TogglePlaylistAsync();
                 await InvokeAsync(StateHasChanged);
                 break;
+            case "toggleCompact":
+                await ToggleCompactAsync();
+                await InvokeAsync(StateHasChanged);
+                break;
         }
     }
 
+    private async Task OnFullPathsDroppedAsync(string[] paths)
+    {
+        if (paths.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _pendingPaths.Clear();
+            AddPendingPaths(paths);
+            _lastLibraryFolder = ResolveLibraryRoot(paths);
+            await LoadPendingMediaAsync();
+        }
+        catch (Exception exception)
+        {
+            Toasts.Error($"Could not load dropped media: {exception.Message}");
+            DebugLog.Error($"Windows drop load failed: {exception.Message}");
+        }
+    }
+
+    private static string? ResolveLibraryRoot(IEnumerable<string> paths)
+    {
+        var first = paths.FirstOrDefault(static path => !string.IsNullOrWhiteSpace(path));
+
+        if (first is null)
+        {
+            return null;
+        }
+
+        return Directory.Exists(first)
+            ? first
+            : Path.GetDirectoryName(first);
+    }
+
+    private async Task PersistLibraryResumeAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_lastLibraryFolder) || !Playlist.HasItems || Playlist.CurrentIndex < 0)
+        {
+            return;
+        }
+
+        _lastPersistedResumeIndex = Playlist.CurrentIndex;
+        await SettingsService.SetLibraryResumeIndexAsync(_lastLibraryFolder, Playlist.CurrentIndex);
+    }
+
     [JSInvokable]
-    public Task OnOutsideClick()
+    public async Task OnOutsideClick()
     {
         // Outside-click closes both the overflow menu and any other popovers
         // (settings, future) registered with the shared popover service.
-        var hadOverflow = _overflowOpen;
-        _overflowOpen = false;
+        CloseOverflowMenu();
         Popovers.CloseAll();
-
-        return hadOverflow ? InvokeAsync(StateHasChanged) : Task.CompletedTask;
+        await SyncOverlaySuppressionAsync();
+        await InvokeAsync(StateHasChanged);
     }
 
     private Task TogglePlaybackAsync()
@@ -750,8 +867,22 @@
             : Playback.PlayAsync();
     }
 
+    private void OnPlaylistChanged()
+    {
+        if (Playlist.CurrentIndex >= 0 && Playlist.CurrentIndex != _lastPersistedResumeIndex)
+        {
+            _ = PersistLibraryResumeAsync();
+        }
+
+        OnStateChanged();
+    }
+
     private void OnPlaybackChanged()
     {
+        if (Playback.Status == PlaybackStatus.Stopped)
+        {
+            _ = PersistLibraryResumeAsync();
+        }
         // Window title reflects the now-playing item ONLY while Playing or Paused.
         // When Stopped (user pressed Stop, or playback finished with LoopMode.Off
         // and an empty queue) we clear back to the bare app name so the chrome
@@ -798,10 +929,12 @@
 
     public async ValueTask DisposeAsync()
     {
-        Playlist.Changed -= OnStateChanged;
+        Playlist.Changed -= OnPlaylistChanged;
         Playback.Changed -= OnPlaybackChanged;
+        FullPathDrop.PathsDropped -= OnFullPathsDroppedAsync;
         Fullscreen.FullscreenChanged -= OnStateChanged;
         Popovers.CloseRequested -= OnPopoversCloseRequested;
+        Popovers.SettingsPanelOpenChanged -= OnSettingsPanelOpenChanged;
         Popovers.AnyOpenChanged -= OnPopoverAnyOpenChanged;
 
         try

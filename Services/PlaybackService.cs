@@ -5,11 +5,15 @@ namespace MauiMediaPlayer.Services;
 public sealed class PlaybackService(
     PlaylistService playlistService,
     SettingsService settingsService,
+    FavoritesService favoritesService,
     DebugLogService debugLog,
     NativeVideoPlaybackService nativeVideoPlayback,
-    MediaSourceService mediaSourceService) : IAsyncDisposable
+    MediaSourceService mediaSourceService,
+    ToastService toasts) : IAsyncDisposable
 {
     private const int MaxSlots = 3;
+    // Stagger multi-split image timer firings so three panes don't refresh in one frame.
+    private static readonly int[] MultiSplitTimerStaggerMs = [0, 75, 150];
     private readonly CancellationTokenSource?[] _slotTimers = new CancellationTokenSource?[MaxSlots];
     private readonly Guid?[] _slotTimerItemIds = new Guid?[MaxSlots];
     private readonly int[] _slotIndices = Enumerable.Repeat(-1, MaxSlots).ToArray();
@@ -39,8 +43,13 @@ public sealed class PlaybackService(
     private bool _slotIndicesInitialized;
     private int _slotBasePlaylistIndex = -1;
     private Guid? _lastPlayedItemId;
+    private bool _videoTakeoverHintShown;
+    private bool _favoritesEmptyNotified;
+    private bool _mediaKindsEmptyNotified;
 
     public event Action? Changed;
+
+    public int FavoriteCountInPlaylist => favoritesService.CountInPlaylist(playlistService.Items.Select(static item => item.FilePath));
 
     public PlaybackSettings Settings { get; private set; } = new();
 
@@ -72,7 +81,9 @@ public sealed class PlaybackService(
         // for example) that don't flow through RefreshPlaylistAsync so the cache doesn't
         // hold bytes for items that left the playlist. Cheap O(cache-size) sweep.
         playlistService.Changed += PruneImageCacheToPlaylist;
-        debugLog.Debug($"Playback settings loaded. speed={Settings.PlaybackSpeed}; imageSeconds={Settings.ImageDurationSeconds}; gifRepeats={Settings.GifRepeatCount}; loop={Settings.LoopMode}; shuffle={Settings.Shuffle}; split={Settings.SplitScreenMode}; alwaysShowVideo={Settings.AlwaysShowVideoInSplit}; isolateCenter={Settings.IsolateVideoToCenterPanel}; volume={Settings.Volume}; muted={Settings.Muted}.");
+        favoritesService.Changed += OnFavoritesChanged;
+        SyncPlaylistShuffleCallbacks();
+        LogActiveConfiguration("settings-loaded");
         NotifyChanged();
     }
 
@@ -91,6 +102,16 @@ public sealed class PlaybackService(
             return;
         }
 
+        SnapPlaylistCurrentToEligible();
+
+        if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
+        {
+            NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyMediaKindsFilterEmptyIfNeeded();
+            await StopAsync();
+            return;
+        }
+
         EnsureSlotIndices();
         var primaryItem = GetSlotItem(0);
 
@@ -103,9 +124,12 @@ public sealed class PlaybackService(
 
         Status = PlaybackStatus.Playing;
         debugLog.Info($"Playback started: {primaryItem?.DisplayName} ({primaryItem?.Kind}).");
+        LogActiveConfiguration("playback-started");
         NotifyChanged();
 
         await PlayVisibleSlotsAsync(forceRestartTimers: true);
+        nativeVideoPlayback.RequestLayoutBoundsResync();
+        await nativeVideoPlayback.ReconcilePlaybackSurfacesAsync();
     }
 
     public async Task PauseAsync()
@@ -117,6 +141,7 @@ public sealed class PlaybackService(
 
         Status = PlaybackStatus.Paused;
         debugLog.Info($"Playback paused: {GetSlotItem(0)?.DisplayName}.");
+        LogActiveConfiguration("playback-paused");
         StopAllSlotTimers();
         await nativeVideoPlayback.PauseAsync();
         NotifyChanged();
@@ -126,6 +151,7 @@ public sealed class PlaybackService(
     {
         Status = PlaybackStatus.Stopped;
         debugLog.Info("Playback stopped.");
+        LogActiveConfiguration("playback-stopped");
         VideoPosition = TimeSpan.Zero;
 
         lock (_slotStateLock)
@@ -155,6 +181,8 @@ public sealed class PlaybackService(
             return;
         }
 
+        NotifyFavoritesOnlyEmptyIfNeeded();
+        NotifyMediaKindsFilterEmptyIfNeeded();
         await StopAsync();
     }
 
@@ -167,7 +195,11 @@ public sealed class PlaybackService(
         {
             ResetSlotIndicesFromCurrent();
             await PlayAsync();
+            return;
         }
+
+        NotifyFavoritesOnlyEmptyIfNeeded();
+        NotifyMediaKindsFilterEmptyIfNeeded();
     }
 
     public async Task RandomAsync()
@@ -175,11 +207,22 @@ public sealed class PlaybackService(
         StopAllSlotTimers();
         debugLog.Debug("Random requested.");
 
-        if (playlistService.MoveRandom())
+        var eligible = GetEligiblePlaylistIndices(MediaKindRequirement.Any);
+
+        if (eligible.Count == 0)
         {
-            ResetSlotIndicesFromCurrent();
-            await PlayAsync();
+            NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyMediaKindsFilterEmptyIfNeeded();
+            return;
         }
+
+        if (!playlistService.MoveRandomAmong(eligible))
+        {
+            return;
+        }
+
+        ResetSlotIndicesFromCurrent();
+        await PlayAsync();
     }
 
     public async Task SelectAsync(MediaItem item)
@@ -234,22 +277,60 @@ public sealed class PlaybackService(
         var previousLoopMode = Settings.LoopMode;
         var previousAlwaysShowVideo = Settings.AlwaysShowVideoInSplit;
         var previousIsolateVideo = Settings.IsolateVideoToCenterPanel;
+        var previousSideAdvanceMode = Settings.SideAdvanceMode;
+        var previousSharedSideBag = Settings.SharedSideShuffleBag;
+        var previousVolume = Settings.Volume;
+        var previousMuted = Settings.Muted;
+        var previousSpeed = Settings.PlaybackSpeed;
+        var previousImageDuration = Settings.ImageDurationSeconds;
+        var previousGifRepeats = Settings.GifRepeatCount;
+        var previousPlaylistSource = Settings.PlaylistSource;
+        var previousEnabledMediaKinds = Settings.EnabledMediaKinds;
+        var previousBoostFavorites = Settings.BoostFavoritesInShuffle;
+        var previousFavoriteWeight = Settings.FavoriteShuffleWeight;
         update(Settings);
+        Settings.EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(Settings.EnabledMediaKinds);
         Settings.PlaybackSpeed = Math.Clamp(Settings.PlaybackSpeed, PlaybackSettings.MinPlaybackSpeed, PlaybackSettings.MaxPlaybackSpeed);
         Settings.ImageDurationSeconds = Math.Clamp(Settings.ImageDurationSeconds, PlaybackSettings.MinImageDurationSeconds, PlaybackSettings.MaxImageDurationSeconds);
         Settings.GifRepeatCount = Math.Clamp(Settings.GifRepeatCount, PlaybackSettings.MinGifRepeatCount, PlaybackSettings.MaxGifRepeatCount);
         Settings.Volume = Math.Clamp(Settings.Volume, 0, 1);
         Settings.LoopMode = Enum.IsDefined(Settings.LoopMode) ? Settings.LoopMode : LoopMode.All;
         Settings.SplitScreenMode = Enum.IsDefined(Settings.SplitScreenMode) ? Settings.SplitScreenMode : SplitScreenMode.Single;
+        Settings.PlaylistSource = Enum.IsDefined(Settings.PlaylistSource) ? Settings.PlaylistSource : PlaylistSource.AllLibrary;
+        Settings.FavoriteShuffleWeight = Math.Clamp(
+            Settings.FavoriteShuffleWeight,
+            PlaybackSettings.MinFavoriteShuffleWeight,
+            PlaybackSettings.MaxFavoriteShuffleWeight);
 
         await settingsService.SaveAsync(Settings);
-        debugLog.Debug($"Playback settings updated. speed={Settings.PlaybackSpeed}; imageSeconds={Settings.ImageDurationSeconds}; gifRepeats={Settings.GifRepeatCount}; loop={Settings.LoopMode}; shuffle={Settings.Shuffle}; split={Settings.SplitScreenMode}; alwaysShowVideo={Settings.AlwaysShowVideoInSplit}; isolateCenter={Settings.IsolateVideoToCenterPanel}; volume={Settings.Volume}; muted={Settings.Muted}.");
+        SyncPlaylistShuffleCallbacks();
+        LogActiveConfiguration("settings-updated");
 
         if (Settings.Shuffle != previousShuffle)
         {
             playlistService.ResetShufflePlayback();
             ResetSlotIndicesFromCurrent();
             debugLog.Info(Settings.Shuffle ? "Shuffle enabled." : "Shuffle disabled.");
+        }
+        else if (Settings.PlaylistSource != previousPlaylistSource
+            || Settings.EnabledMediaKinds != previousEnabledMediaKinds
+            || Settings.BoostFavoritesInShuffle != previousBoostFavorites
+            || Settings.FavoriteShuffleWeight != previousFavoriteWeight)
+        {
+            InvalidateShuffleState();
+        }
+
+        var playlistEligibilityChanged = Settings.PlaylistSource != previousPlaylistSource
+            || Settings.EnabledMediaKinds != previousEnabledMediaKinds;
+
+        if (playlistEligibilityChanged)
+        {
+            _favoritesEmptyNotified = false;
+            _mediaKindsEmptyNotified = false;
+            NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyMediaKindsFilterEmptyIfNeeded();
+            SnapPlaylistCurrentToEligible();
+            ResetSlotIndicesFromCurrent();
         }
 
         if (Settings.SplitScreenCount != previousSplitCount || Settings.LoopMode != previousLoopMode)
@@ -264,11 +345,55 @@ public sealed class PlaybackService(
             debugLog.Info($"Split video constraint changed. alwaysShowVideo={Settings.AlwaysShowVideoInSplit}; isolateCenter={Settings.IsolateVideoToCenterPanel}.");
         }
 
+        if (Settings.SideAdvanceMode != previousSideAdvanceMode)
+        {
+            StopSlotTimer(0);
+            StopSlotTimer(2);
+            debugLog.Info($"Side advance mode changed: {Settings.SideAdvanceMode}.");
+        }
+
+        if (Settings.SharedSideShuffleBag != previousSharedSideBag)
+        {
+            lock (_slotStateLock)
+            {
+                ResetSlotShuffleBagsLocked();
+            }
+
+            debugLog.Info($"Shared side shuffle bag {(Settings.SharedSideShuffleBag ? "enabled" : "disabled")}.");
+        }
+
         nativeVideoPlayback.ApplySettings(Settings);
+
+        var requiresVisibleSlotRefresh = Settings.Shuffle != previousShuffle
+            || Settings.SplitScreenCount != previousSplitCount
+            || Settings.LoopMode != previousLoopMode
+            || Settings.AlwaysShowVideoInSplit != previousAlwaysShowVideo
+            || Settings.IsolateVideoToCenterPanel != previousIsolateVideo
+            || Settings.SideAdvanceMode != previousSideAdvanceMode
+            || Settings.SharedSideShuffleBag != previousSharedSideBag
+            || Settings.PlaylistSource != previousPlaylistSource
+            || Settings.EnabledMediaKinds != previousEnabledMediaKinds
+            || Math.Abs(Settings.PlaybackSpeed - previousSpeed) > 0.001
+            || Math.Abs(Settings.ImageDurationSeconds - previousImageDuration) > 0.001
+            || Settings.GifRepeatCount != previousGifRepeats;
+
+        var onlyVolumeOrMuteChanged = !requiresVisibleSlotRefresh
+            && (Math.Abs(Settings.Volume - previousVolume) > 0.001 || Settings.Muted != previousMuted);
 
         if (Status == PlaybackStatus.Playing)
         {
-            await PlayVisibleSlotsAsync(forceRestartTimers: true);
+            if (playlistEligibilityChanged && GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
+            {
+                await StopAsync();
+            }
+            else if (requiresVisibleSlotRefresh)
+            {
+                await PlayVisibleSlotsAsync(forceRestartTimers: true);
+            }
+            else if (!onlyVolumeOrMuteChanged)
+            {
+                await EnsureSlotTimersAsync(forceRestartTimers: true);
+            }
         }
 
         NotifyChanged();
@@ -325,8 +450,16 @@ public sealed class PlaybackService(
         mediaSourceService.RetainOnly(liveIds);
     }
 
-    private void OnNativeVideoEnded(int slotIndex, string? completedPath, int playbackGeneration)
+    private void OnNativeVideoEnded(int slotIndex, string? completedPath, int playbackGeneration, string reason)
     {
+        if (reason is "native-failed" or "play-request-failed" or "startup-timeout")
+        {
+            var label = string.IsNullOrWhiteSpace(completedPath)
+                ? "This video"
+                : Path.GetFileName(completedPath);
+            toasts.Error($"Could not play {label}. Skipping.");
+        }
+
         _ = CompleteSlotAsync(slotIndex, completedPath, playbackGeneration);
     }
 
@@ -402,6 +535,14 @@ public sealed class PlaybackService(
         {
             debugLog.Debug($"Slot {slotIndex + 1} completed; shuffle advancing {item.DisplayName}.");
 
+            if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
+            {
+                NotifyFavoritesOnlyEmptyIfNeeded();
+                NotifyMediaKindsFilterEmptyIfNeeded();
+                await StopAsync();
+                return;
+            }
+
             if (!playlistService.MoveNext(true, Settings.LoopMode))
             {
                 await StopAsync();
@@ -448,6 +589,11 @@ public sealed class PlaybackService(
         debugLog.Info($"Slot {slotIndex + 1} advanced: {previousIndex} -> {_slotIndices[slotIndex]}; item={nextItem?.DisplayName} ({nextItem?.Kind}).");
         _slotNativeGenerations[slotIndex] = null;
 
+        if (slotIndex == 1 && Settings.SideAdvanceMode == SideAdvanceMode.OnCentreChange)
+        {
+            await AdvanceCoupledSideSlotsAsync();
+        }
+
         if (slotIndex == 0)
         {
             var primaryItem = GetSlotItem(0);
@@ -476,10 +622,48 @@ public sealed class PlaybackService(
         NotifyChanged();
     }
 
+    private async Task AdvanceCoupledSideSlotsAsync()
+    {
+        if (Settings.SideAdvanceMode != SideAdvanceMode.OnCentreChange || Settings.SplitScreenCount < 3)
+        {
+            return;
+        }
+
+        foreach (var sideSlot in new[] { 0, 2 })
+        {
+            if (!IsActiveSlot(sideSlot))
+            {
+                continue;
+            }
+
+            var previousIndex = _slotIndices[sideSlot];
+            if (!AdvanceSlotIndex(sideSlot))
+            {
+                StopSlotTimer(sideSlot);
+                continue;
+            }
+
+            debugLog.Info($"Side slot {sideSlot + 1} coupled to centre change: {previousIndex} -> {_slotIndices[sideSlot]}; item={GetSlotItem(sideSlot)?.DisplayName}.");
+            await PlaySingleSlotAsync(sideSlot, forceRestartTimer: true, restartVideoIfSameSource: true);
+        }
+
+        NotifyChanged();
+    }
+
+    private TimeSpan GetSlotTimerStagger(int slotIndex)
+    {
+        if (Settings.SplitScreenCount <= 1 || slotIndex < 0 || slotIndex >= MultiSplitTimerStaggerMs.Length)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return TimeSpan.FromMilliseconds(MultiSplitTimerStaggerMs[slotIndex]);
+    }
+
     private async Task PlayVisibleSlotsAsync(bool forceRestartTimers)
     {
         EnsureSlotIndices();
-        debugLog.Trace($"Refreshing all visible slots. forceRestartTimers={forceRestartTimers}; slots={DescribeVisibleSlots()}.");
+        debugLog.Trace($"Refreshing all visible slots. forceRestartTimers={forceRestartTimers}; slots={DescribeVisibleSlots()}; {Settings.FormatForDebugLogCompact()}.");
 
         // Phase 3 (a): prime cache for currently-visible images BEFORE any awaits so
         // the read races Blazor's first render. MediaSourceService coalesces in-flight
@@ -528,7 +712,7 @@ public sealed class PlaybackService(
         }
 
         var item = GetSlotItem(slotIndex);
-        debugLog.Trace($"Refreshing slot {slotIndex + 1}. forceRestartTimer={forceRestartTimer}; restartVideoIfSameSource={restartVideoIfSameSource}; index={_slotIndices[slotIndex]}; item={item?.DisplayName} ({item?.Kind}).");
+        debugLog.Trace($"Refreshing slot {slotIndex + 1}. forceRestartTimer={forceRestartTimer}; restartVideoIfSameSource={restartVideoIfSameSource}; index={_slotIndices[slotIndex]}; item={item?.DisplayName} ({item?.Kind}); {Settings.FormatForDebugLogCompact()}.");
         await nativeVideoPlayback.PlaySlotAsync(slotIndex, item, Settings, restartVideoIfSameSource);
         await EnsureSlotTimerAsync(slotIndex, forceRestartTimer);
     }
@@ -573,6 +757,15 @@ public sealed class PlaybackService(
 
         if (item.IsTimedVisual)
         {
+            if (Settings.SideAdvanceMode == SideAdvanceMode.OnCentreChange
+                && Settings.SplitScreenCount >= 3
+                && slotIndex is 0 or 2)
+            {
+                StopSlotTimer(slotIndex);
+                debugLog.Trace($"Slot {slotIndex + 1} timer deferred; advances with centre pane. item={item.DisplayName}.");
+                return;
+            }
+
             if (forceRestartTimer || _slotTimerItemIds[slotIndex] != item.Id)
             {
                 await StartSlotTimerAsync(slotIndex, item);
@@ -613,10 +806,17 @@ public sealed class PlaybackService(
         // render hits a cached data URI instead of the "Loading image..." placeholder.
         TriggerPrefetchForSlot(slotIndex);
 
+        var stagger = GetSlotTimerStagger(slotIndex);
+
         _ = Task.Run(async () =>
         {
             try
             {
+                if (stagger > TimeSpan.Zero)
+                {
+                    await Task.Delay(stagger, cancellationToken);
+                }
+
                 await Task.Delay(duration, cancellationToken);
 
                 if (!cancellationToken.IsCancellationRequested
@@ -763,6 +963,7 @@ public sealed class PlaybackService(
 
             _slotIndicesInitialized = true;
             ApplySlotConstraintsLocked(allowSlot0Move);
+            AlignSlotsToEligibilityLocked();
         }
     }
 
@@ -830,23 +1031,17 @@ public sealed class PlaybackService(
                 return false;
             }
 
-            // Safety-net early return when the feature is fully off so the hot path is
-            // byte-for-byte identical to the prior behavior for users who never toggle the
-            // new checkbox.
             if (!Settings.AlwaysShowVideoInSplit || stride <= 1)
             {
-                _slotIndices[slotIndex] = strideCandidate;
-                return true;
+                return TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
             }
 
             if (Settings.IsVideoIsolationActive)
             {
                 var requirement = Settings.GetSlotKindRequirement(slotIndex);
 
-                if (requirement == MediaKindRequirement.Any
-                    || MatchesRequirement(items[strideCandidate].Kind, requirement))
+                if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, requirement))
                 {
-                    _slotIndices[slotIndex] = strideCandidate;
                     return true;
                 }
 
@@ -857,9 +1052,13 @@ public sealed class PlaybackService(
                     return true;
                 }
 
-                _slotIndices[slotIndex] = strideCandidate;
-                MaybeWarnUnsatisfiable(slotIndex, requirement);
-                return true;
+                if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                {
+                    MaybeWarnUnsatisfiable(slotIndex, requirement);
+                    return true;
+                }
+
+                return false;
             }
 
             if (Settings.RequiresAtLeastOneVideo)
@@ -867,8 +1066,10 @@ public sealed class PlaybackService(
                 if (items[strideCandidate].Kind == MediaKind.Video
                     || AnyActiveSlotIsVideo(exceptSlotIndex: slotIndex))
                 {
-                    _slotIndices[slotIndex] = strideCandidate;
-                    return true;
+                    if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                    {
+                        return true;
+                    }
                 }
 
                 if (TryFindNextIndex(slotIndex, strideCandidate + 1, MediaKindRequirement.VideoOnly, out var found))
@@ -878,13 +1079,16 @@ public sealed class PlaybackService(
                     return true;
                 }
 
-                _slotIndices[slotIndex] = strideCandidate;
-                MaybeWarnUnsatisfiable(slotIndex, MediaKindRequirement.VideoOnly);
-                return true;
+                if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                {
+                    MaybeWarnUnsatisfiable(slotIndex, MediaKindRequirement.VideoOnly);
+                    return true;
+                }
+
+                return false;
             }
 
-            _slotIndices[slotIndex] = strideCandidate;
-            return true;
+            return TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
         }
     }
 
@@ -916,7 +1120,7 @@ public sealed class PlaybackService(
             if (Settings.Shuffle && stride > 1)
             {
                 var requirement = ComputeAdvanceRequirementForSlot(slotIndex);
-                var queue = _slotShuffleQueues[slotIndex];
+                var queue = GetShuffleQueueLocked(slotIndex);
 
                 if (queue is { Count: > 0 })
                 {
@@ -965,6 +1169,16 @@ public sealed class PlaybackService(
             }
             else
             {
+                return null;
+            }
+
+            if (!IsPlaylistIndexEligibleForSource(strideCandidate))
+            {
+                if (TryFindNextIndex(slotIndex, strideCandidate, MediaKindRequirement.Any, out var eligiblePeek))
+                {
+                    return items[eligiblePeek];
+                }
+
                 return null;
             }
 
@@ -1038,6 +1252,7 @@ public sealed class PlaybackService(
     {
         try
         {
+            await mediaSourceService.PrefetchThumbnailAsync(item);
             await mediaSourceService.PrefetchImageAsync(item);
         }
         catch (Exception ex)
@@ -1098,7 +1313,7 @@ public sealed class PlaybackService(
         }
 
         var allowWrap = Settings.LoopMode == LoopMode.All;
-        var queue = _slotShuffleQueues[slotIndex] ??= new Queue<int>();
+        var queue = GetShuffleQueueLocked(slotIndex);
 
         // Bounded by two refills: the first either resolves to a candidate or empties the
         // bag, the second covers wrap-around in LoopMode.All. Anything beyond means every
@@ -1171,7 +1386,14 @@ public sealed class PlaybackService(
     {
         AssertSlotStateLockHeld();
 
-        var queue = _slotShuffleQueues[slotIndex] ??= new Queue<int>();
+        if (Settings.SharedSideShuffleBag && slotIndex == 2 && Settings.SplitScreenCount >= 3)
+        {
+            RefillSlotShuffleQueueLocked(0);
+            _slotShuffleQueueInitialized[2] = _slotShuffleQueueInitialized[0];
+            return;
+        }
+
+        var queue = GetShuffleQueueLocked(slotIndex);
         queue.Clear();
 
         var count = playlistService.Items.Count;
@@ -1182,26 +1404,22 @@ public sealed class PlaybackService(
             return;
         }
 
-        var indices = new int[count];
+        var requirement = ComputeAdvanceRequirementForSlot(slotIndex);
+        var entries = BuildWeightedShuffleEntriesLocked(requirement);
 
-        for (var i = 0; i < count; i++)
-        {
-            indices[i] = i;
-        }
-
-        for (var i = count - 1; i > 0; i--)
+        for (var i = entries.Count - 1; i > 0; i--)
         {
             var j = Random.Shared.Next(i + 1);
-            (indices[i], indices[j]) = (indices[j], indices[i]);
+            (entries[i], entries[j]) = (entries[j], entries[i]);
         }
 
-        foreach (var idx in indices)
+        foreach (var idx in entries)
         {
             queue.Enqueue(idx);
         }
 
         _slotShuffleQueueInitialized[slotIndex] = true;
-        debugLog.Trace($"Slot {slotIndex + 1} shuffle bag refilled: size={queue.Count}; loopMode={Settings.LoopMode}.");
+        debugLog.Trace($"Slot {slotIndex + 1} shuffle bag refilled: size={queue.Count}; loopMode={Settings.LoopMode}; playlistSource={Settings.PlaylistSource}.");
     }
 
     // Caller MUST hold _slotStateLock.
@@ -1258,6 +1476,35 @@ public sealed class PlaybackService(
     // Linear forward scan with optional wrap (LoopMode.All) starting at startInclusive.
     // Returns the first index whose kind satisfies the requirement and is not currently
     // held by another active slot. Caller MUST hold _slotStateLock.
+    private bool TryAdvanceSlotToIndex(int slotIndex, int preferredIndex, MediaKindRequirement requirement)
+    {
+        AssertSlotStateLockHeld();
+
+        var items = playlistService.Items;
+        var count = items.Count;
+
+        if (preferredIndex < 0 || preferredIndex >= count)
+        {
+            return false;
+        }
+
+        if (IsPlaylistIndexEligibleForSource(preferredIndex)
+            && MatchesRequirement(items[preferredIndex].Kind, requirement)
+            && !HasSlotCollisionLocked(slotIndex, preferredIndex))
+        {
+            _slotIndices[slotIndex] = preferredIndex;
+            return true;
+        }
+
+        if (TryFindNextIndex(slotIndex, preferredIndex, requirement, out var found))
+        {
+            _slotIndices[slotIndex] = found;
+            return true;
+        }
+
+        return false;
+    }
+
     private bool TryFindNextIndex(int slotIndex, int startInclusive, MediaKindRequirement requirement, out int foundIndex)
     {
         AssertSlotStateLockHeld();
@@ -1325,6 +1572,11 @@ public sealed class PlaybackService(
                 continue;
             }
 
+            if (!IsPlaylistIndexEligibleForSource(candidate))
+            {
+                continue;
+            }
+
             if (MatchesRequirement(items[candidate].Kind, requirement))
             {
                 foundIndex = candidate;
@@ -1333,6 +1585,261 @@ public sealed class PlaybackService(
         }
 
         return false;
+    }
+
+    private void OnFavoritesChanged()
+    {
+        SyncPlaylistShuffleCallbacks();
+        InvalidateShuffleState();
+        ApplyPlaylistEligibilityToCurrentState();
+        NotifyChanged();
+    }
+
+    private void ApplyPlaylistEligibilityToCurrentState()
+    {
+        if (!NeedsPlaylistIndexFilter() || !playlistService.HasItems)
+        {
+            return;
+        }
+
+        SnapPlaylistCurrentToEligible();
+
+        if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
+        {
+            if (Status == PlaybackStatus.Playing)
+            {
+                _ = StopAsync();
+            }
+
+            return;
+        }
+
+        if (Status == PlaybackStatus.Playing)
+        {
+            ResetSlotIndicesFromCurrent();
+            _ = PlayVisibleSlotsAsync(forceRestartTimers: true);
+            return;
+        }
+
+        lock (_slotStateLock)
+        {
+            if (_slotIndicesInitialized)
+            {
+                AlignSlotsToEligibilityLocked();
+            }
+        }
+    }
+
+    private void SyncPlaylistShuffleCallbacks()
+    {
+        playlistService.ShuffleIndexFilter = NeedsPlaylistIndexFilter()
+            ? IsPlaylistIndexEligibleForSource
+            : null;
+        playlistService.ShuffleIndexWeight = GetShuffleWeightForIndex;
+    }
+
+    private bool NeedsPlaylistIndexFilter() =>
+        Settings.PlaylistSource == PlaylistSource.FavoritesOnly
+        || !Settings.IsAllMediaKindsEnabled;
+
+    private void InvalidateShuffleState()
+    {
+        lock (_slotStateLock)
+        {
+            ResetSlotShuffleBagsLocked();
+        }
+
+        playlistService.RebuildShuffleQueue();
+    }
+
+    private void NotifyFavoritesOnlyEmptyIfNeeded()
+    {
+        if (Settings.PlaylistSource != PlaylistSource.FavoritesOnly || FavoriteCountInPlaylist > 0)
+        {
+            return;
+        }
+
+        if (_favoritesEmptyNotified)
+        {
+            return;
+        }
+
+        _favoritesEmptyNotified = true;
+        toasts.Info("No favorites in this library. Heart items on a pane or switch back to All.");
+    }
+
+    private void NotifyMediaKindsFilterEmptyIfNeeded()
+    {
+        if (Settings.IsAllMediaKindsEnabled || !playlistService.HasItems)
+        {
+            return;
+        }
+
+        if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count > 0)
+        {
+            return;
+        }
+
+        if (_mediaKindsEmptyNotified)
+        {
+            return;
+        }
+
+        _mediaKindsEmptyNotified = true;
+        toasts.Info("No items match the selected media types. Enable Images, Videos, or GIFs in the playlist.");
+    }
+
+    private void SnapPlaylistCurrentToEligible()
+    {
+        if (!playlistService.HasItems)
+        {
+            return;
+        }
+
+        var currentIndex = playlistService.CurrentIndex;
+
+        if (currentIndex >= 0 && IsPlaylistIndexEligibleForSource(currentIndex))
+        {
+            return;
+        }
+
+        var items = playlistService.Items;
+
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (IsPlaylistIndexEligibleForSource(index))
+            {
+                playlistService.SetCurrentIndex(index);
+                return;
+            }
+        }
+    }
+
+    private bool IsPlaylistIndexEligibleForSource(int index)
+    {
+        var items = playlistService.Items;
+
+        if (index < 0 || index >= items.Count)
+        {
+            return false;
+        }
+
+        if (!Settings.IsMediaKindEnabled(items[index].Kind))
+        {
+            return false;
+        }
+
+        if (Settings.PlaylistSource == PlaylistSource.FavoritesOnly)
+        {
+            return favoritesService.IsFavorite(items[index].FilePath);
+        }
+
+        return true;
+    }
+
+    private int GetShuffleWeightForIndex(int index)
+    {
+        if (Settings.PlaylistSource != PlaylistSource.AllLibrary
+            || !Settings.Shuffle
+            || !Settings.BoostFavoritesInShuffle)
+        {
+            return 1;
+        }
+
+        var items = playlistService.Items;
+
+        if (index < 0 || index >= items.Count)
+        {
+            return 1;
+        }
+
+        return favoritesService.IsFavorite(items[index].FilePath)
+            ? Settings.FavoriteShuffleWeight
+            : 1;
+    }
+
+    private List<int> GetEligiblePlaylistIndices(MediaKindRequirement requirement)
+    {
+        var items = playlistService.Items;
+        var eligible = new List<int>(items.Count);
+
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (!IsPlaylistIndexEligibleForSource(index))
+            {
+                continue;
+            }
+
+            if (!MatchesRequirement(items[index].Kind, requirement))
+            {
+                continue;
+            }
+
+            eligible.Add(index);
+        }
+
+        return eligible;
+    }
+
+    private List<int> BuildWeightedShuffleEntriesLocked(MediaKindRequirement requirement)
+    {
+        AssertSlotStateLockHeld();
+        var entries = new List<int>();
+        var items = playlistService.Items;
+
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (!IsPlaylistIndexEligibleForSource(index))
+            {
+                continue;
+            }
+
+            if (!MatchesRequirement(items[index].Kind, requirement))
+            {
+                continue;
+            }
+
+            var weight = GetShuffleWeightForIndex(index);
+
+            for (var copy = 0; copy < weight; copy++)
+            {
+                entries.Add(index);
+            }
+        }
+
+        return entries;
+    }
+
+    private void AlignSlotsToEligibilityLocked()
+    {
+        AssertSlotStateLockHeld();
+
+        if (!NeedsPlaylistIndexFilter())
+        {
+            return;
+        }
+
+        for (var slotIndex = 0; slotIndex < Settings.SplitScreenCount; slotIndex++)
+        {
+            if (!IsActiveSlot(slotIndex) || _slotIndices[slotIndex] < 0)
+            {
+                continue;
+            }
+
+            if (IsPlaylistIndexEligibleForSource(_slotIndices[slotIndex]))
+            {
+                continue;
+            }
+
+            if (TryFindNextIndex(slotIndex, _slotIndices[slotIndex], MediaKindRequirement.Any, out var found))
+            {
+                _slotIndices[slotIndex] = found;
+            }
+            else
+            {
+                _slotIndices[slotIndex] = -1;
+            }
+        }
     }
 
     // Returns true if any active slot other than exceptSlotIndex currently points to a Video.
@@ -1461,6 +1968,7 @@ public sealed class PlaybackService(
                     {
                         debugLog.Trace($"Slot {slot + 1} took over video role; moved from index={siblingIdx} to index={siblingFound} (selection respected on slot 1).");
                         _slotIndices[slot] = siblingFound;
+                        MaybeShowVideoTakeoverHint();
                         return;
                     }
                 }
@@ -1476,6 +1984,7 @@ public sealed class PlaybackService(
             {
                 debugLog.Trace($"Slot 1 took over video role; moved from index={slot0Idx} to index={slot0Found}.");
                 _slotIndices[0] = slot0Found;
+                MaybeShowVideoTakeoverHint();
 
                 var primary = GetSlotItem(0);
 
@@ -1509,6 +2018,37 @@ public sealed class PlaybackService(
         _slotLastUnsatisfiableTraceIndex[slotIndex] = currentIdx;
         debugLog.Trace($"Slot {slotIndex + 1} {requirement} constraint cannot be satisfied; falling back to stride candidate {currentIdx}.");
     }
+
+    private Queue<int> GetShuffleQueueLocked(int slotIndex)
+    {
+        AssertSlotStateLockHeld();
+
+        if (Settings.SharedSideShuffleBag && slotIndex == 2 && Settings.SplitScreenCount >= 3)
+        {
+            return _slotShuffleQueues[0] ??= new Queue<int>();
+        }
+
+        return _slotShuffleQueues[slotIndex] ??= new Queue<int>();
+    }
+
+    private void MaybeShowVideoTakeoverHint()
+    {
+        if (_videoTakeoverHintShown)
+        {
+            return;
+        }
+
+        _videoTakeoverHintShown = true;
+        toasts.Info("A side pane took over video playback so your selection stays visible in the center.");
+    }
+
+    private void LogActiveConfiguration(string reason)
+    {
+        debugLog.Debug(
+            $"Active configuration ({reason}). status={Status}; playlistItems={playlistService.Items.Count}; playlistPosition={playlistService.CounterText}; {Settings.FormatForDebugLog()}; visibleSlots={DescribeVisibleSlots()}.");
+    }
+
+    public string DescribeVisibleSlotsForDiagnostics() => DescribeVisibleSlots();
 
     private string DescribeVisibleSlots()
     {
@@ -1569,6 +2109,7 @@ public sealed class PlaybackService(
         nativeVideoPlayback.EndReached -= OnNativeVideoEnded;
         nativeVideoPlayback.PlaybackStarted -= OnNativeVideoStarted;
         playlistService.Changed -= PruneImageCacheToPlaylist;
+        favoritesService.Changed -= OnFavoritesChanged;
         return ValueTask.CompletedTask;
     }
 }

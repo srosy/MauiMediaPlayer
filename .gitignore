@@ -79,6 +79,9 @@ nunit-*.xml
 **/WebView2/
 **/EBWebView/
 
+# Release installers — host elsewhere (GitHub limit is 100 MB per file)
+install/
+
 # Signing / secrets — never commit
 *.pfx
 *.snk

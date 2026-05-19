@@ -1,5 +1,6 @@
 @implements IDisposable
 @inject DebugLogService DebugLog
+@inject PlaybackService Playback
 @inject ToastService Toasts
 
 @* Debug footer. Phase E: collapsed by default into a 32px-tall bar. Clicking
@@ -25,8 +26,16 @@
             <button class="icon-btn"
                     type="button"
                     style="height:24px;width:24px;"
-                    title="Copy log"
-                    aria-label="Copy log"
+                    title="Copy diagnostics (app, playback settings, visible slots, and log)"
+                    aria-label="Copy diagnostics"
+                    @onclick="CopyDiagnosticsAsync">
+                <Icon Name="info-circle" Size="12" />
+            </button>
+            <button class="icon-btn"
+                    type="button"
+                    style="height:24px;width:24px;"
+                    title="Copy debug log only"
+                    aria-label="Copy debug log"
                     @onclick="CopyAsync">
                 <Icon Name="clipboard" Size="12" />
             </button>
@@ -77,6 +86,40 @@
         {
             ToggleExpanded();
         }
+    }
+
+    private async Task CopyDiagnosticsAsync()
+    {
+        var header = BuildDiagnosticsHeaderWithPlayback();
+        var text = DebugLog.BuildDiagnosticsReport(header);
+
+        try
+        {
+            await Clipboard.Default.SetTextAsync(text);
+            await ShowStatusAsync("Copied");
+            Toasts.Success("Diagnostics copied to clipboard.");
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Error($"Diagnostics copy failed: {ex.Message}");
+            await ShowStatusAsync("Copy failed");
+            Toasts.Error("Could not copy diagnostics to clipboard.");
+        }
+    }
+
+    private static string BuildDiagnosticsHeader()
+    {
+        var builder = new System.Text.StringBuilder();
+        builder.AppendLine($"App: {Branding.AppName} {Branding.Version}");
+        builder.AppendLine($"OS: {DeviceInfo.Platform} {DeviceInfo.VersionString}");
+        builder.AppendLine($"Runtime: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}");
+        return builder.ToString();
+    }
+
+    private string BuildDiagnosticsHeaderWithPlayback()
+    {
+        var header = BuildDiagnosticsHeader();
+        return $"{header}Playback: status={Playback.Status}; {Playback.Settings.FormatForDebugLog()}; visible={Playback.DescribeVisibleSlotsForDiagnostics()}.{Environment.NewLine}";
     }
 
     private async Task CopyAsync()

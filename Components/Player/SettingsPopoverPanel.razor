@@ -1,0 +1,262 @@
+@implements IDisposable
+@inject PlaybackService Playback
+@inject PlaylistService Playlist
+@inject PopoverStateService Popovers
+
+<div class="app-popover app-popover-settings" role="dialog" aria-label="Playback settings"
+     @onclick:stopPropagation="true">
+
+    <div class="app-popover-row">
+        <div class="app-popover-title">Playback</div>
+
+        <label class="form-label" for="settingsSpeed">
+            Playback speed: @Playback.Settings.PlaybackSpeed.ToString("0.##")x
+        </label>
+        <input id="settingsSpeed"
+               class="form-range"
+               type="range"
+               min="@PlaybackSettings.MinPlaybackSpeed"
+               max="@PlaybackSettings.MaxPlaybackSpeed"
+               step="0.25"
+               value="@Playback.Settings.PlaybackSpeed"
+               @onchange="SetSpeedAsync" />
+    </div>
+
+    <div class="app-popover-row">
+        <div class="app-popover-title">Slideshow</div>
+
+        @if (Playback.Settings.IsVideoIsolationActive)
+        {
+            <div class="form-text">
+                Side panes use independent random durations between
+                @PlaybackSettings.RandomizedSideImageMinSeconds.ToString("0")&ndash;@PlaybackSettings.RandomizedSideImageMaxSeconds.ToString("0")s
+                so they don&rsquo;t change in lockstep while the center video plays.
+            </div>
+        }
+        else
+        {
+            <label class="form-label" for="settingsImageSeconds">
+                Image seconds: @Playback.Settings.ImageDurationSeconds.ToString("0")
+            </label>
+            <input id="settingsImageSeconds"
+                   class="form-range"
+                   type="range"
+                   min="@PlaybackSettings.MinImageDurationSeconds"
+                   max="@PlaybackSettings.MaxImageDurationSeconds"
+                   step="1"
+                   value="@Playback.Settings.ImageDurationSeconds"
+                   @onchange="SetImageDurationAsync" />
+        }
+
+        <label class="form-label mt-2" for="settingsGifRepeats">
+            GIF repeats: @Playback.Settings.GifRepeatCount
+        </label>
+        <input id="settingsGifRepeats"
+               class="form-control form-control-sm"
+               type="number"
+               min="@PlaybackSettings.MinGifRepeatCount"
+               max="@PlaybackSettings.MaxGifRepeatCount"
+               step="1"
+               value="@Playback.Settings.GifRepeatCount"
+               @onchange="SetGifRepeatsAsync" />
+    </div>
+
+    @if (Playback.Settings.SplitScreenMode != SplitScreenMode.Single)
+    {
+        var playlistHasVideo = PlaylistHasVideo();
+
+        <div class="app-popover-row">
+            <div class="app-popover-title">Split-screen behavior</div>
+
+            <div class="form-check">
+                <input id="settingsAlwaysShowVideo"
+                       class="form-check-input"
+                       type="checkbox"
+                       checked="@Playback.Settings.AlwaysShowVideoInSplit"
+                       disabled="@(!playlistHasVideo)"
+                       @onchange="SetAlwaysShowVideoAsync" />
+                <label class="form-check-label" for="settingsAlwaysShowVideo"
+                       title="@(playlistHasVideo ? null : "Add at least one video to the playlist to enable this option.")">
+                    Always show a video
+                </label>
+            </div>
+
+            @if (Playback.Settings.SplitScreenMode == SplitScreenMode.TriSplit
+                 && Playback.Settings.AlwaysShowVideoInSplit
+                 && playlistHasVideo)
+            {
+                <div class="form-check mt-1">
+                    <input id="settingsIsolateVideo"
+                           class="form-check-input"
+                           type="checkbox"
+                           checked="@Playback.Settings.IsolateVideoToCenterPanel"
+                           @onchange="SetIsolateVideoAsync" />
+                    <label class="form-check-label" for="settingsIsolateVideo">
+                        Isolate video to center pane
+                    </label>
+                </div>
+            }
+
+            @if (Playback.Settings.SplitScreenMode == SplitScreenMode.TriSplit && playlistHasVideo)
+            {
+                <button class="btn btn-sm btn-outline-primary mt-2 w-100"
+                        type="button"
+                        @onclick="ApplyCentreVideoPresetAsync">
+                    Centre video layout
+                </button>
+            }
+
+            @if (Playback.Settings.SplitScreenMode == SplitScreenMode.TriSplit)
+            {
+                <label class="form-label mt-2" for="settingsSideAdvance">Side pane advance</label>
+                <select id="settingsSideAdvance"
+                        class="form-select form-select-sm"
+                        value="@Playback.Settings.SideAdvanceMode"
+                        @onchange="SetSideAdvanceModeAsync">
+                    <option value="@SideAdvanceMode.Independent">Independent timers</option>
+                    <option value="@SideAdvanceMode.OnCentreChange">When centre changes</option>
+                </select>
+
+                <div class="form-check mt-2">
+                    <input id="settingsSharedSideBag"
+                           class="form-check-input"
+                           type="checkbox"
+                           checked="@Playback.Settings.SharedSideShuffleBag"
+                           @onchange="SetSharedSideShuffleBagAsync" />
+                    <label class="form-check-label" for="settingsSharedSideBag">
+                        Shared side shuffle bag
+                    </label>
+                </div>
+            }
+        </div>
+    }
+
+    <div class="app-popover-row">
+        <div class="app-popover-title">Favorites</div>
+
+        <div class="form-check">
+            <input id="settingsBoostFavorites"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.BoostFavoritesInShuffle"
+                   disabled="@(!CanBoostFavoritesInShuffle)"
+                   @onchange="SetBoostFavoritesAsync" />
+            <label class="form-check-label" for="settingsBoostFavorites"
+                   title="@(CanBoostFavoritesInShuffle ? null : "Available when playing all library with shuffle on.")">
+                Boost favorites in shuffle
+            </label>
+        </div>
+
+        <label class="form-label mt-2" for="settingsFavoriteWeight">
+            Favorite frequency: @Playback.Settings.FavoriteShuffleWeight&times;
+        </label>
+        <input id="settingsFavoriteWeight"
+               class="form-range"
+               type="range"
+               min="@PlaybackSettings.MinFavoriteShuffleWeight"
+               max="@PlaybackSettings.MaxFavoriteShuffleWeight"
+               step="1"
+               value="@Playback.Settings.FavoriteShuffleWeight"
+               disabled="@(!CanAdjustFavoriteWeight)"
+               @onchange="SetFavoriteWeightAsync" />
+    </div>
+
+    <div class="app-popover-row">
+        <div class="app-popover-title">Library</div>
+        <div class="form-check">
+            <input id="settingsRecursive"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.RecursiveFolderScan"
+                   @onchange="SetRecursiveAsync" />
+            <label class="form-check-label" for="settingsRecursive">
+                Scan folders recursively
+            </label>
+        </div>
+    </div>
+</div>
+
+@code {
+    protected override void OnInitialized()
+    {
+        Playback.Changed += OnChanged;
+        Playlist.Changed += OnChanged;
+    }
+
+    private bool PlaylistHasVideo()
+    {
+        foreach (var item in Playlist.Items)
+        {
+            if (item.Kind == MediaKind.Video)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Task SetSpeedAsync(ChangeEventArgs args) =>
+        double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var speed)
+            ? Playback.UpdateSettingsAsync(s => s.PlaybackSpeed = speed)
+            : Task.CompletedTask;
+
+    private Task SetImageDurationAsync(ChangeEventArgs args) =>
+        double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+            ? Playback.UpdateSettingsAsync(s => s.ImageDurationSeconds = seconds)
+            : Task.CompletedTask;
+
+    private Task SetGifRepeatsAsync(ChangeEventArgs args) =>
+        int.TryParse(args.Value?.ToString(), out var count)
+            ? Playback.UpdateSettingsAsync(s => s.GifRepeatCount = count)
+            : Task.CompletedTask;
+
+    private Task SetAlwaysShowVideoAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.AlwaysShowVideoInSplit = args.Value is bool enabled && enabled);
+
+    private Task SetIsolateVideoAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.IsolateVideoToCenterPanel = args.Value is bool enabled && enabled);
+
+    private Task ApplyCentreVideoPresetAsync() =>
+        Playback.UpdateSettingsAsync(s => s.ApplyCentreVideoLayoutPreset());
+
+    private Task SetSideAdvanceModeAsync(ChangeEventArgs args) =>
+        Enum.TryParse<SideAdvanceMode>(args.Value?.ToString(), out var mode)
+            ? Playback.UpdateSettingsAsync(s => s.SideAdvanceMode = mode)
+            : Task.CompletedTask;
+
+    private Task SetSharedSideShuffleBagAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.SharedSideShuffleBag = args.Value is bool enabled && enabled);
+
+    private Task SetRecursiveAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.RecursiveFolderScan = args.Value is bool enabled && enabled);
+
+    private bool CanBoostFavoritesInShuffle =>
+        Playback.Settings.PlaylistSource == PlaylistSource.AllLibrary
+        && Playback.Settings.Shuffle;
+
+    private bool CanAdjustFavoriteWeight =>
+        CanBoostFavoritesInShuffle && Playback.Settings.BoostFavoritesInShuffle;
+
+    private Task SetBoostFavoritesAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.BoostFavoritesInShuffle = args.Value is bool enabled && enabled);
+
+    private Task SetFavoriteWeightAsync(ChangeEventArgs args)
+    {
+        if (!int.TryParse(args.Value?.ToString(), out var weight))
+        {
+            return Task.CompletedTask;
+        }
+
+        weight = Math.Clamp(weight, PlaybackSettings.MinFavoriteShuffleWeight, PlaybackSettings.MaxFavoriteShuffleWeight);
+        return Playback.UpdateSettingsAsync(s => s.FavoriteShuffleWeight = weight);
+    }
+
+    private void OnChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Playback.Changed -= OnChanged;
+        Playlist.Changed -= OnChanged;
+    }
+}

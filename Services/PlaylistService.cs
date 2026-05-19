@@ -107,6 +107,16 @@ public sealed class PlaylistService
             return false;
         }
 
+        return SetCurrentIndex(index);
+    }
+
+    public bool SetCurrentIndex(int index)
+    {
+        if (index < 0 || index >= _items.Count)
+        {
+            return false;
+        }
+
         if (_currentIndex >= 0 && _currentIndex != index)
         {
             _shuffleHistory.Push(_currentIndex);
@@ -135,6 +145,11 @@ public sealed class PlaylistService
         if (shuffle)
         {
             return MoveToNextShuffleItem(loopMode);
+        }
+
+        if (ShuffleIndexFilter is not null)
+        {
+            return MoveToNextSequentialFiltered(loopMode);
         }
 
         if (_currentIndex < _items.Count - 1)
@@ -166,6 +181,11 @@ public sealed class PlaylistService
             _currentIndex = previousIndex;
             NotifyChanged();
             return true;
+        }
+
+        if (ShuffleIndexFilter is not null && !shuffle)
+        {
+            return MoveToPreviousSequentialFiltered();
         }
 
         if (_currentIndex > 0)
@@ -232,6 +252,36 @@ public sealed class PlaylistService
         NotifyChanged();
     }
 
+    public void RebuildShuffleQueue()
+    {
+        ResetShuffleQueue();
+        NotifyChanged();
+    }
+
+    public Func<int, bool>? ShuffleIndexFilter { get; set; }
+
+    public Func<int, int>? ShuffleIndexWeight { get; set; }
+
+    public bool MoveRandomAmong(IReadOnlyList<int> eligibleIndices)
+    {
+        if (eligibleIndices.Count == 0)
+        {
+            return false;
+        }
+
+        if (_currentIndex >= 0)
+        {
+            _shuffleHistory.Push(_currentIndex);
+        }
+
+        _currentIndex = eligibleIndices.Count == 1
+            ? eligibleIndices[0]
+            : eligibleIndices[Random.Shared.Next(eligibleIndices.Count)];
+
+        NotifyChanged();
+        return true;
+    }
+
     private void Sort(Func<MediaItem, string> keySelector)
     {
         var currentItem = CurrentItem;
@@ -266,14 +316,20 @@ public sealed class PlaylistService
 
         if (_shuffleQueue.Count == 0)
         {
-            if (loopMode == LoopMode.All)
+            var fallback = FindFilteredIndex(preferNotCurrent: true);
+            if (fallback < 0)
             {
-                _currentIndex = 0;
-                NotifyChanged();
-                return true;
+                return false;
             }
 
-            return false;
+            if (_currentIndex >= 0)
+            {
+                _shuffleHistory.Push(_currentIndex);
+            }
+
+            _currentIndex = fallback;
+            NotifyChanged();
+            return true;
         }
 
         if (_currentIndex >= 0)
@@ -290,10 +346,143 @@ public sealed class PlaylistService
     {
         _shuffleQueue.Clear();
 
-        foreach (var index in Enumerable.Range(0, _items.Count).Where(index => index != _currentIndex).OrderBy(_ => _random.Next()))
+        if (_items.Count == 0)
+        {
+            return;
+        }
+
+        var entries = new List<int>();
+
+        for (var index = 0; index < _items.Count; index++)
+        {
+            if (index == _currentIndex)
+            {
+                continue;
+            }
+
+            if (ShuffleIndexFilter is not null && !ShuffleIndexFilter(index))
+            {
+                continue;
+            }
+
+            var weight = Math.Max(1, ShuffleIndexWeight?.Invoke(index) ?? 1);
+
+            for (var copy = 0; copy < weight; copy++)
+            {
+                entries.Add(index);
+            }
+        }
+
+        for (var i = entries.Count - 1; i > 0; i--)
+        {
+            var j = _random.Next(i + 1);
+            (entries[i], entries[j]) = (entries[j], entries[i]);
+        }
+
+        foreach (var index in entries)
         {
             _shuffleQueue.Enqueue(index);
         }
+    }
+
+    private bool MoveToNextSequentialFiltered(LoopMode loopMode)
+    {
+        var count = _items.Count;
+        var start = _currentIndex < 0 ? -1 : _currentIndex;
+
+        for (var step = 1; step <= count; step++)
+        {
+            var candidate = start + step;
+
+            if (candidate >= count)
+            {
+                if (loopMode != LoopMode.All)
+                {
+                    return false;
+                }
+
+                candidate %= count;
+            }
+
+            if (ShuffleIndexFilter!(candidate))
+            {
+                if (_currentIndex >= 0)
+                {
+                    _shuffleHistory.Push(_currentIndex);
+                }
+
+                _currentIndex = candidate;
+                NotifyChanged();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool MoveToPreviousSequentialFiltered()
+    {
+        var count = _items.Count;
+        var start = _currentIndex < 0 ? count : _currentIndex;
+
+        for (var step = 1; step <= count; step++)
+        {
+            var candidate = start - step;
+
+            if (candidate < 0)
+            {
+                return false;
+            }
+
+            if (ShuffleIndexFilter!(candidate))
+            {
+                if (_currentIndex >= 0)
+                {
+                    _shuffleHistory.Push(_currentIndex);
+                }
+
+                _currentIndex = candidate;
+                NotifyChanged();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private int FindFilteredIndex(bool preferNotCurrent)
+    {
+        for (var index = 0; index < _items.Count; index++)
+        {
+            if (ShuffleIndexFilter is not null && !ShuffleIndexFilter(index))
+            {
+                continue;
+            }
+
+            if (preferNotCurrent && index == _currentIndex)
+            {
+                continue;
+            }
+
+            return index;
+        }
+
+        if (!preferNotCurrent)
+        {
+            return -1;
+        }
+
+        for (var index = 0; index < _items.Count; index++)
+        {
+            if (ShuffleIndexFilter is not null && !ShuffleIndexFilter(index))
+            {
+                continue;
+            }
+
+            return index;
+        }
+
+        return -1;
     }
 
     private int GetRandomIndexExcept(int exceptIndex)

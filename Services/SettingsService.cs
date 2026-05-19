@@ -16,6 +16,13 @@ public sealed class SettingsService
     private const string SplitScreenModeKey = "split-screen-mode";
     private const string AlwaysShowVideoInSplitKey = "always-show-video-in-split";
     private const string IsolateVideoToCenterPanelKey = "isolate-video-to-center-panel";
+    private const string SideAdvanceModeKey = "side-advance-mode";
+    private const string SharedSideShuffleBagKey = "shared-side-shuffle-bag";
+    private const string PlaylistSourceKey = "playlist-source";
+    private const string BoostFavoritesInShuffleKey = "boost-favorites-in-shuffle";
+    private const string FavoriteShuffleWeightKey = "favorite-shuffle-weight";
+    private const string EnabledMediaKindsKey = "enabled-media-kinds";
+    private const string LibraryResumePositionsKey = "library-resume-positions";
     private const string RecentPathsKey = "recent-paths";
     private const string LastMediaPathsKey = "last-media-paths";
 
@@ -38,7 +45,20 @@ public sealed class SettingsService
                 ? splitScreenMode
                 : SplitScreenMode.Single,
             AlwaysShowVideoInSplit = Preferences.Default.Get(AlwaysShowVideoInSplitKey, false),
-            IsolateVideoToCenterPanel = Preferences.Default.Get(IsolateVideoToCenterPanelKey, false)
+            IsolateVideoToCenterPanel = Preferences.Default.Get(IsolateVideoToCenterPanelKey, false),
+            SideAdvanceMode = Enum.TryParse<SideAdvanceMode>(Preferences.Default.Get(SideAdvanceModeKey, SideAdvanceMode.Independent.ToString()), out var sideAdvanceMode)
+                && Enum.IsDefined(sideAdvanceMode)
+                ? sideAdvanceMode
+                : SideAdvanceMode.Independent,
+            SharedSideShuffleBag = Preferences.Default.Get(SharedSideShuffleBagKey, false),
+            PlaylistSource = Enum.TryParse<PlaylistSource>(Preferences.Default.Get(PlaylistSourceKey, PlaylistSource.AllLibrary.ToString()), out var playlistSource)
+                && Enum.IsDefined(playlistSource)
+                ? playlistSource
+                : PlaylistSource.AllLibrary,
+            BoostFavoritesInShuffle = Preferences.Default.Get(BoostFavoritesInShuffleKey, true),
+            FavoriteShuffleWeight = Preferences.Default.Get(FavoriteShuffleWeightKey, PlaybackSettings.DefaultFavoriteShuffleWeight),
+            EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(
+                (PlaybackMediaKinds)Preferences.Default.Get(EnabledMediaKindsKey, (int)PlaybackMediaKinds.All))
         };
 
         settings.PlaybackSpeed = Math.Clamp(settings.PlaybackSpeed, PlaybackSettings.MinPlaybackSpeed, PlaybackSettings.MaxPlaybackSpeed);
@@ -47,6 +67,12 @@ public sealed class SettingsService
         settings.Volume = Math.Clamp(settings.Volume, 0, 1);
         settings.LoopMode = Enum.IsDefined(settings.LoopMode) ? settings.LoopMode : LoopMode.All;
         settings.SplitScreenMode = Enum.IsDefined(settings.SplitScreenMode) ? settings.SplitScreenMode : SplitScreenMode.Single;
+        settings.PlaylistSource = Enum.IsDefined(settings.PlaylistSource) ? settings.PlaylistSource : PlaylistSource.AllLibrary;
+        settings.FavoriteShuffleWeight = Math.Clamp(
+            settings.FavoriteShuffleWeight,
+            PlaybackSettings.MinFavoriteShuffleWeight,
+            PlaybackSettings.MaxFavoriteShuffleWeight);
+        settings.EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(settings.EnabledMediaKinds);
 
         return Task.FromResult(settings);
     }
@@ -64,9 +90,66 @@ public sealed class SettingsService
         Preferences.Default.Set(SplitScreenModeKey, (Enum.IsDefined(settings.SplitScreenMode) ? settings.SplitScreenMode : SplitScreenMode.Single).ToString());
         Preferences.Default.Set(AlwaysShowVideoInSplitKey, settings.AlwaysShowVideoInSplit);
         Preferences.Default.Set(IsolateVideoToCenterPanelKey, settings.IsolateVideoToCenterPanel);
+        Preferences.Default.Set(SideAdvanceModeKey, settings.SideAdvanceMode.ToString());
+        Preferences.Default.Set(SharedSideShuffleBagKey, settings.SharedSideShuffleBag);
+        Preferences.Default.Set(PlaylistSourceKey, (Enum.IsDefined(settings.PlaylistSource) ? settings.PlaylistSource : PlaylistSource.AllLibrary).ToString());
+        Preferences.Default.Set(BoostFavoritesInShuffleKey, settings.BoostFavoritesInShuffle);
+        Preferences.Default.Set(
+            FavoriteShuffleWeightKey,
+            Math.Clamp(settings.FavoriteShuffleWeight, PlaybackSettings.MinFavoriteShuffleWeight, PlaybackSettings.MaxFavoriteShuffleWeight));
+        Preferences.Default.Set(
+            EnabledMediaKindsKey,
+            (int)PlaybackSettings.NormalizeEnabledMediaKinds(settings.EnabledMediaKinds));
 
         return Task.CompletedTask;
     }
+
+    public Task<int?> GetLibraryResumeIndexAsync(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return Task.FromResult<int?>(null);
+        }
+
+        var map = LoadLibraryResumeMap();
+        return Task.FromResult<int?>(map.TryGetValue(NormalizeFolderPath(folderPath), out var index) ? index : null);
+    }
+
+    public Task SetLibraryResumeIndexAsync(string folderPath, int playlistIndex)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || playlistIndex < 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var map = LoadLibraryResumeMap();
+        map[NormalizeFolderPath(folderPath)] = playlistIndex;
+        Preferences.Default.Set(LibraryResumePositionsKey, JsonSerializer.Serialize(map));
+        return Task.CompletedTask;
+    }
+
+    private static Dictionary<string, int> LoadLibraryResumeMap()
+    {
+        var json = Preferences.Default.Get(LibraryResumePositionsKey, string.Empty);
+
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, int>>(json)
+                ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+        catch (JsonException)
+        {
+            return new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static string NormalizeFolderPath(string folderPath) =>
+        Path.GetFullPath(folderPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
     public Task<IReadOnlyList<string>> GetRecentPathsAsync()
     {
