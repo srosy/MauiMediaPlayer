@@ -1,8 +1,11 @@
+using System.Text;
+
 namespace MauiMediaPlayer.Services;
 
 public sealed class DebugLogService
 {
     private const int MaxEntries = 1000;
+    private const long MaxSessionLogBytes = 2L * 1024 * 1024;
     private readonly Lock _lock = new();
     private readonly Queue<string> _entries = [];
 
@@ -55,11 +58,30 @@ public sealed class DebugLogService
         Add("ERROR", message);
     }
 
-    private void Add(string level, string message)
+    public string BuildDiagnosticsReport(string header)
     {
         lock (_lock)
         {
-            _entries.Enqueue($"[{DateTimeOffset.Now:HH:mm:ss}] {level}: {message}");
+            var builder = new StringBuilder(header.Length + (_entries.Count * 96));
+            builder.AppendLine(header);
+            builder.AppendLine();
+            builder.AppendLine("--- Debug log (most recent) ---");
+            foreach (var entry in _entries)
+            {
+                builder.AppendLine(entry);
+            }
+
+            return builder.ToString();
+        }
+    }
+
+    private void Add(string level, string message)
+    {
+        var line = $"[{DateTimeOffset.Now:HH:mm:ss}] {level}: {message}";
+
+        lock (_lock)
+        {
+            _entries.Enqueue(line);
 
             while (_entries.Count > MaxEntries)
             {
@@ -67,7 +89,42 @@ public sealed class DebugLogService
             }
         }
 
+        AppendToSessionLog(line);
         Changed?.Invoke();
+    }
+
+    private void AppendToSessionLog(string line)
+    {
+        try
+        {
+            var path = GetSessionLogPath();
+            var directory = Path.GetDirectoryName(path);
+
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            if (File.Exists(path) && new FileInfo(path).Length > MaxSessionLogBytes)
+            {
+                return;
+            }
+
+            File.AppendAllText(path, line + Environment.NewLine);
+        }
+        catch
+        {
+        }
+    }
+
+    private static string GetSessionLogPath()
+    {
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Mosaic",
+            "logs");
+
+        return Path.Combine(root, $"session-{DateTime.Now:yyyy-MM-dd}.txt");
     }
 
     public void Clear()

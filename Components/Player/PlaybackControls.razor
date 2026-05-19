@@ -131,6 +131,19 @@
         </div>
 
         <div class="transport-cluster" role="group" aria-label="Output">
+            @* Compact mode hides the header (including the overflow menu), so this
+               control is the only in-app way to restore the chrome without a pref reset. *@
+            @if (IsCompactMode)
+            {
+                <button class="icon-btn is-active"
+                        type="button"
+                        title="Exit compact mode (restore header and playlist)"
+                        aria-label="Exit compact mode"
+                        @onclick="InvokeExitCompactAsync">
+                    <Icon Name="fullscreen-exit" />
+                </button>
+            }
+
             <button class="icon-btn @(Playback.Settings.Muted ? "is-active" : null)"
                     type="button"
                     title="@(Playback.Settings.Muted ? "Unmute (M)" : "Mute (M)")"
@@ -165,6 +178,10 @@
 </div>
 
 @code {
+    [Parameter] public bool IsCompactMode { get; set; }
+
+    [Parameter] public EventCallback OnExitCompact { get; set; }
+
     private bool _settingsOpen;
 
     protected override void OnInitialized()
@@ -208,6 +225,8 @@
         SplitScreenMode.TriSplit => "layout-three-columns",
         _ => "layout-sidebar",
     };
+
+    private Task InvokeExitCompactAsync() => OnExitCompact.InvokeAsync();
 
     private Task ToggleShuffleAsync() =>
         Playback.UpdateSettingsAsync(s => s.Shuffle = !s.Shuffle);

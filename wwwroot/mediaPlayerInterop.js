@@ -112,7 +112,69 @@ window.mauiMediaPlayer = {
         };
     },
 
+    // Sub-pixel jitter from ResizeObserver during neighbour image swaps was nudging
+    // native MediaElements and causing visible "jumping". Coalesce + epsilon-filter.
+    _boundsEpsilon: 0.75,
+
+    _boundsNearlyEqual(a, b) {
+        if (!a || !b) {
+            return false;
+        }
+
+        const eps = window.mauiMediaPlayer._boundsEpsilon;
+        return Math.abs(a.x - b.x) < eps
+            && Math.abs(a.y - b.y) < eps
+            && Math.abs(a.width - b.width) < eps
+            && Math.abs(a.height - b.height) < eps;
+    },
+
+    requestMediaPaneBoundsFlush() {
+        if (typeof window._mauiMediaPlayerBoundsHandler === 'function') {
+            window._mauiMediaPlayerBoundsHandler();
+        }
+    },
+
+    invalidateMediaPaneBoundsCache() {
+        if (Array.isArray(window._mauiMediaPlayerBoundsLastReported)) {
+            window._mauiMediaPlayerBoundsLastReported = [null, null, null];
+        }
+    },
+
+    watchImages(dotNetReference) {
+        if (!dotNetReference) {
+            return;
+        }
+
+        document.querySelectorAll('.media-pane:not(.is-video-pane) img.media-image-ready, .media-pane:not(.is-video-pane) img.media-image-holdover').forEach((image) => {
+            if (image._mauiImageWatched) {
+                return;
+            }
+
+            image._mauiImageWatched = true;
+            window.mauiMediaPlayer.initializeImage(image, dotNetReference, image.alt || 'image');
+        });
+    },
+
+    ensureMediaPaneObservers() {
+        const observer = window._mauiMediaPlayerBoundsObserver;
+        if (!observer) {
+            return;
+        }
+
+        document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+            if (!pane._mauiBoundsObserved) {
+                pane._mauiBoundsObserved = true;
+                observer.observe(pane);
+            }
+        });
+    },
+
     observeMediaViewportBounds(dotNetReference) {
+        if (window._mauiMediaPlayerBoundsNotifyTimer) {
+            clearTimeout(window._mauiMediaPlayerBoundsNotifyTimer);
+            window._mauiMediaPlayerBoundsNotifyTimer = null;
+        }
+
         if (window._mauiMediaPlayerBoundsHandler) {
             window.removeEventListener('resize', window._mauiMediaPlayerBoundsHandler);
             window.visualViewport?.removeEventListener('resize', window._mauiMediaPlayerBoundsHandler);
@@ -123,10 +185,27 @@ window.mauiMediaPlayer = {
             window._mauiMediaPlayerBoundsObserver.disconnect();
         }
 
-        const notify = () => {
+        window._mauiMediaPlayerBoundsDotNet = dotNetReference;
+        window._mauiMediaPlayerBoundsLastReported = [null, null, null];
+
+        const flushBounds = () => {
+            window._mauiMediaPlayerBoundsNotifyTimer = null;
+            window.mauiMediaPlayer.ensureMediaPaneObservers();
+
+            const ref = window._mauiMediaPlayerBoundsDotNet;
+            if (!ref) {
+                return;
+            }
+
             for (let slotIndex = 0; slotIndex < 3; slotIndex++) {
                 const bounds = window.mauiMediaPlayer.getMediaPaneBounds(slotIndex);
-                dotNetReference.invokeMethodAsync(
+                const last = window._mauiMediaPlayerBoundsLastReported[slotIndex];
+                if (window.mauiMediaPlayer._boundsNearlyEqual(bounds, last)) {
+                    continue;
+                }
+
+                window._mauiMediaPlayerBoundsLastReported[slotIndex] = bounds;
+                ref.invokeMethodAsync(
                     'OnMediaPaneBoundsChanged',
                     slotIndex,
                     bounds.x,
@@ -136,25 +215,41 @@ window.mauiMediaPlayer = {
             }
         };
 
-        window._mauiMediaPlayerBoundsHandler = notify;
-        window.addEventListener('resize', notify);
-        window.visualViewport?.addEventListener('resize', notify);
-        window.visualViewport?.addEventListener('scroll', notify);
+        const scheduleBoundsNotify = () => {
+            if (window._mauiMediaPlayerBoundsNotifyTimer) {
+                return;
+            }
+
+            window._mauiMediaPlayerBoundsNotifyTimer = setTimeout(flushBounds, 48);
+        };
+
+        window._mauiMediaPlayerBoundsHandler = scheduleBoundsNotify;
+        window.addEventListener('resize', scheduleBoundsNotify);
+        window.visualViewport?.addEventListener('resize', scheduleBoundsNotify);
+        window.visualViewport?.addEventListener('scroll', scheduleBoundsNotify);
 
         const viewport = document.querySelector('.media-viewport');
         if (viewport && window.ResizeObserver) {
-            window._mauiMediaPlayerBoundsObserver = new ResizeObserver(notify);
+            window._mauiMediaPlayerBoundsObserver = new ResizeObserver(scheduleBoundsNotify);
             window._mauiMediaPlayerBoundsObserver.observe(viewport);
-
             document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+                pane._mauiBoundsObserved = true;
                 window._mauiMediaPlayerBoundsObserver.observe(pane);
             });
         }
 
-        setTimeout(notify, 0);
+        setTimeout(flushBounds, 0);
     },
 
     disposeMediaViewportBoundsObserver() {
+        if (window._mauiMediaPlayerBoundsNotifyTimer) {
+            clearTimeout(window._mauiMediaPlayerBoundsNotifyTimer);
+            window._mauiMediaPlayerBoundsNotifyTimer = null;
+        }
+
+        window._mauiMediaPlayerBoundsDotNet = null;
+        window._mauiMediaPlayerBoundsLastReported = [null, null, null];
+
         if (window._mauiMediaPlayerBoundsHandler) {
             window.removeEventListener('resize', window._mauiMediaPlayerBoundsHandler);
             window.visualViewport?.removeEventListener('resize', window._mauiMediaPlayerBoundsHandler);
@@ -166,6 +261,10 @@ window.mauiMediaPlayer = {
             window._mauiMediaPlayerBoundsObserver.disconnect();
             window._mauiMediaPlayerBoundsObserver = null;
         }
+
+        document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+            delete pane._mauiBoundsObserved;
+        });
     },
 
     // Toggles an `is-mouse-active` class on the player root so CSS can fade caption
@@ -267,6 +366,12 @@ window.mauiMediaPlayer = {
             if (!hasReservedModifier && (event.key === 'l' || event.key === 'L')) {
                 event.preventDefault();
                 dotNetReference.invokeMethodAsync('OnAppShortcut', 'togglePlaylist').catch(() => { });
+                return;
+            }
+
+            if (!hasReservedModifier && (event.key === 'c' || event.key === 'C')) {
+                event.preventDefault();
+                dotNetReference.invokeMethodAsync('OnAppShortcut', 'toggleCompact').catch(() => { });
             }
         };
 

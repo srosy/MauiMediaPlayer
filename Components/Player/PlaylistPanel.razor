@@ -1,12 +1,14 @@
 @implements IDisposable
 @inject PlaylistService Playlist
 @inject PlaybackService Playback
+@inject FavoritesService Favorites
 @inject IFileSystemActionsService FileSystemActions
 @inject ToastService Toasts
+@using MauiMediaPlayer.Models
 
-@* Playlist sidebar. Phase D: kind stats, type filter chips, sort dropdown
-   (replacing 3 buttons), and hover-revealed row actions. Collapse state is a
-   parameter owned by PlayerShell so the toggle button there stays in sync. *@
+@* Playlist sidebar: source chips, multi-select media-kind toggles (playback +
+   list), sort dropdown, and hover-revealed row actions. Collapse state is owned
+   by PlayerShell so the toggle button there stays in sync. *@
 
 <aside class="playlist-panel @(IsCollapsed ? "is-collapsed" : null)"
        @onkeydown:stopPropagation="true">
@@ -42,14 +44,33 @@
             }
         </div>
 
-        <div class="playlist-filter-chips" role="tablist" aria-label="Filter by media kind">
-            @foreach (var chip in FilterChips)
+        <div class="playlist-filter-chips" role="tablist" aria-label="Playlist source">
+            @foreach (var chip in SourceChips)
             {
-                <button class="filter-chip @(_kindFilter == chip.Kind ? "is-active" : null)"
+                <button class="filter-chip @(Playback.Settings.PlaylistSource == chip.Source ? "is-active" : null)"
                         type="button"
                         role="tab"
-                        aria-selected="@(_kindFilter == chip.Kind ? "true" : "false")"
-                        @onclick="() => SetKindFilter(chip.Kind)">
+                        aria-selected="@(Playback.Settings.PlaylistSource == chip.Source ? "true" : "false")"
+                        @onclick="() => SetPlaylistSourceAsync(chip.Source)">
+                    @chip.Label
+                </button>
+            }
+        </div>
+
+        <div class="playlist-filter-chips" role="group" aria-label="Media types to play">
+            <button class="filter-chip @(IsAllKindsEnabled ? "is-active" : null)"
+                    type="button"
+                    aria-pressed="@(IsAllKindsEnabled ? "true" : "false")"
+                    title="Enable images, videos, and GIFs"
+                    @onclick="EnableAllMediaKindsAsync">
+                All
+            </button>
+            @foreach (var chip in KindChips)
+            {
+                <button class="filter-chip @(IsKindEnabled(chip.Kind) ? "is-active" : null)"
+                        type="button"
+                        aria-pressed="@(IsKindEnabled(chip.Kind) ? "true" : "false")"
+                        @onclick="() => ToggleMediaKindAsync(chip.Kind)">
                     @chip.Label
                 </button>
             }
@@ -88,28 +109,40 @@
     else if (FilteredItems.Count == 0)
     {
         <div class="playlist-empty">
-            <Icon Name="search" Size="22" />
-            <div>No items match the current filters.</div>
-            <button class="btn btn-sm btn-outline-secondary" type="button"
-                    @onclick="ClearFiltersAsync">Reset filters</button>
+            @if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly
+                 && Playback.FavoriteCountInPlaylist == 0)
+            {
+                <Icon Name="heart-fill" Size="22" />
+                <div>No favorites in this library.</div>
+                <div class="form-text">Use the heart on a pane while hovering to add favorites.</div>
+            }
+            else
+            {
+                <Icon Name="search" Size="22" />
+                <div>No items match the current filters.</div>
+                <button class="btn btn-sm btn-outline-secondary" type="button"
+                        @onclick="ClearFiltersAsync">Reset filters</button>
+            }
         </div>
     }
     else
     {
         <ul class="playlist-items">
-            @foreach (var item in FilteredItems)
-            {
-                var isCurrent = Playlist.CurrentItem?.Id == item.Id;
-
-                @* HTML5 forbids interactive nesting (button-in-button), so the row is
-                   a flex container with a primary "select" button on the left and a
-                   sibling action cluster on the right. Keyboard users can tab into
-                   each control independently. *@
+            <Virtualize Items="FilteredItems" Context="item" ItemSize="52">
+                @{
+                    var isCurrent = Playlist.CurrentItem?.Id == item.Id;
+                }
                 <li class="playlist-item @(isCurrent ? "is-current" : null)">
                     <button class="playlist-item-main"
                             type="button"
                             title="@item.FilePath"
                             @onclick="() => Playback.SelectAsync(item)">
+                        @if (Favorites.IsFavorite(item.FilePath))
+                        {
+                            <span class="playlist-item-favorite" title="Favorite" aria-hidden="true">
+                                <Icon Name="heart-fill" Size="12" />
+                            </span>
+                        }
                         <span class="playlist-item-icon">
                             <Icon Name="@IconForKind(item.Kind)" Size="14" />
                         </span>
@@ -137,7 +170,7 @@
                         </button>
                     </span>
                 </li>
-            }
+            </Virtualize>
         </ul>
     }
 </aside>
@@ -150,16 +183,25 @@
     private enum SortMode { Name, Path, Newest }
 
     private string _filter = string.Empty;
-    private MediaKind? _kindFilter;
     private SortMode _sortMode = SortMode.Name;
+    private List<MediaItem> _filteredItems = [];
 
-    private static readonly IReadOnlyList<(MediaKind? Kind, string Label)> FilterChips =
+    private static readonly IReadOnlyList<(PlaylistSource Source, string Label)> SourceChips =
     [
-        (null, "All"),
+        (PlaylistSource.AllLibrary, "All"),
+        (PlaylistSource.FavoritesOnly, "Favorites"),
+    ];
+
+    private static readonly IReadOnlyList<(MediaKind Kind, string Label)> KindChips =
+    [
         (MediaKind.Image, "Images"),
         (MediaKind.Video, "Videos"),
         (MediaKind.Gif, "GIFs"),
     ];
+
+    private bool IsAllKindsEnabled => Playback.Settings.IsAllMediaKindsEnabled;
+
+    private bool IsKindEnabled(MediaKind kind) => Playback.Settings.IsMediaKindEnabled(kind);
 
     private string StatsLine
     {
@@ -186,40 +228,41 @@
                 }
             }
 
-            var parts = new List<string> { $"{total} item{(total == 1 ? "" : "s")}" };
-            if (videoCount > 0) parts.Add($"{videoCount} video{(videoCount == 1 ? "" : "s")}");
-            if (imageCount > 0) parts.Add($"{imageCount} image{(imageCount == 1 ? "" : "s")}");
-            if (gifCount > 0) parts.Add($"{gifCount} GIF{(gifCount == 1 ? "" : "s")}");
+            var favoriteCount = Playback.FavoriteCountInPlaylist;
+            var parts = new List<string>();
+
+            if (favoriteCount > 0)
+            {
+                parts.Add($"{favoriteCount} favorite{(favoriteCount == 1 ? "" : "s")}");
+            }
+
+            parts.Add($"{total} total");
+
+            if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly
+                || !Playback.Settings.IsAllMediaKindsEnabled)
+            {
+                var shown = _filteredItems.Count;
+                parts.Add($"{shown} shown");
+            }
+            else
+            {
+                if (videoCount > 0) parts.Add($"{videoCount} video{(videoCount == 1 ? "" : "s")}");
+                if (imageCount > 0) parts.Add($"{imageCount} image{(imageCount == 1 ? "" : "s")}");
+                if (gifCount > 0) parts.Add($"{gifCount} GIF{(gifCount == 1 ? "" : "s")}");
+            }
 
             return string.Join(" \u00B7 ", parts);
         }
     }
 
-    private List<MediaItem> FilteredItems
-    {
-        get
-        {
-            IEnumerable<MediaItem> items = Playlist.Items;
-
-            if (_kindFilter is MediaKind kind)
-            {
-                items = items.Where(item => item.Kind == kind);
-            }
-
-            if (!string.IsNullOrWhiteSpace(_filter))
-            {
-                items = items.Where(item =>
-                    item.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase)
-                    || item.FilePath.Contains(_filter, StringComparison.OrdinalIgnoreCase));
-            }
-
-            return items.ToList();
-        }
-    }
+    private ICollection<MediaItem> FilteredItems => _filteredItems;
 
     protected override void OnInitialized()
     {
         Playlist.Changed += OnStateChanged;
+        Playback.Changed += OnStateChanged;
+        Favorites.Changed += OnStateChanged;
+        RebuildFilteredItems();
     }
 
     private void OnFilterChanged(ChangeEventArgs args)
@@ -230,11 +273,82 @@
     private void SetFilter(string value)
     {
         _filter = value;
+        RebuildFilteredItems();
     }
 
-    private void SetKindFilter(MediaKind? kind)
+    private async Task EnableAllMediaKindsAsync()
     {
-        _kindFilter = kind;
+        if (Playback.Settings.IsAllMediaKindsEnabled)
+        {
+            return;
+        }
+
+        await Playback.UpdateSettingsAsync(s => s.EnabledMediaKinds = PlaybackMediaKinds.All);
+        RebuildFilteredItems();
+    }
+
+    private async Task ToggleMediaKindAsync(MediaKind kind)
+    {
+        var flag = KindToFlag(kind);
+        var current = Playback.Settings.EnabledMediaKinds;
+
+        if (current.HasFlag(flag))
+        {
+            var remaining = current & ~flag;
+            if (remaining == PlaybackMediaKinds.None)
+            {
+                Toasts.Info("At least one media type must stay enabled.");
+                return;
+            }
+
+            await Playback.UpdateSettingsAsync(s => s.EnabledMediaKinds = remaining);
+        }
+        else
+        {
+            await Playback.UpdateSettingsAsync(s => s.EnabledMediaKinds = current | flag);
+        }
+
+        RebuildFilteredItems();
+    }
+
+    private static PlaybackMediaKinds KindToFlag(MediaKind kind) => kind switch
+    {
+        MediaKind.Image => PlaybackMediaKinds.Images,
+        MediaKind.Video => PlaybackMediaKinds.Videos,
+        MediaKind.Gif => PlaybackMediaKinds.Gifs,
+        _ => PlaybackMediaKinds.None
+    };
+
+    private async Task SetPlaylistSourceAsync(PlaylistSource source)
+    {
+        if (Playback.Settings.PlaylistSource == source)
+        {
+            return;
+        }
+
+        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = source);
+        RebuildFilteredItems();
+    }
+
+    private void RebuildFilteredItems()
+    {
+        IEnumerable<MediaItem> items = Playlist.Items;
+
+        if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly)
+        {
+            items = items.Where(item => Favorites.IsFavorite(item.FilePath));
+        }
+
+        items = items.Where(item => Playback.Settings.IsMediaKindEnabled(item.Kind));
+
+        if (!string.IsNullOrWhiteSpace(_filter))
+        {
+            items = items.Where(item =>
+                item.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                || item.FilePath.Contains(_filter, StringComparison.OrdinalIgnoreCase));
+        }
+
+        _filteredItems = items.ToList();
     }
 
     private async Task SetSortAsync(ChangeEventArgs args)
@@ -271,8 +385,14 @@
     private async Task ClearFiltersAsync()
     {
         _filter = string.Empty;
-        _kindFilter = null;
-        await Task.CompletedTask;
+
+        await Playback.UpdateSettingsAsync(s =>
+        {
+            s.PlaylistSource = PlaylistSource.AllLibrary;
+            s.EnabledMediaKinds = PlaybackMediaKinds.All;
+        });
+
+        RebuildFilteredItems();
     }
 
     private async Task RevealAsync(MediaItem item)
@@ -329,11 +449,14 @@
 
     private void OnStateChanged()
     {
+        RebuildFilteredItems();
         _ = InvokeAsync(StateHasChanged);
     }
 
     public void Dispose()
     {
         Playlist.Changed -= OnStateChanged;
+        Playback.Changed -= OnStateChanged;
+        Favorites.Changed -= OnStateChanged;
     }
 }
