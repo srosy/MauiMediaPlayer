@@ -173,7 +173,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         var bounds = new Rect(x, y, Math.Max(0, width), Math.Max(0, height));
         var hasPlayableBounds = bounds.Width > 1 && bounds.Height > 1;
         var boundsUnchanged = slot.LastBounds == bounds;
-        var needsChromeReconcile = slot.BoundsResyncPending || NeedsChromeReconciliation(slot, hasPlayableBounds, _overlaySuppressed);
+        var needsChromeReconcile = slot.BoundsResyncPending || NeedsChromeReconciliation(slot, hasPlayableBounds, IsSlotChromeSuppressed(slot));
 
         if (boundsUnchanged && !needsChromeReconcile)
         {
@@ -211,7 +211,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
             // bounds — the SwapChainPanel would jump back on top of the overlay on
             // the next resize event. SuppressForOverlayAsync(false) is the single
             // place that restores LastBounds when the overlay closes.
-            var shouldExposeBounds = slot.IsVisible && hasPlayableBounds && !_overlaySuppressed;
+            var shouldExposeBounds = slot.IsVisible && hasPlayableBounds && !IsSlotChromeSuppressed(slot);
             TrySetMediaElementChrome(
                 slot.MediaElement,
                 shouldExposeBounds ? bounds : HiddenBounds,
@@ -254,7 +254,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         }
     }
 
-    private static bool NeedsChromeReconciliation(VideoSlot slot, bool hasPlayableBounds, bool overlaySuppressed)
+    private static bool NeedsChromeReconciliation(VideoSlot slot, bool hasPlayableBounds, bool chromeSuppressed)
     {
         if (!hasPlayableBounds)
         {
@@ -262,7 +262,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         }
 
         return (slot.PendingReveal && slot.HasObservedPlayback)
-            || (slot.IsVisible && !overlaySuppressed);
+            || (slot.IsVisible && !chromeSuppressed);
     }
 
     public async Task ShowAsync(int slotIndex)
@@ -352,9 +352,9 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         slot.PendingReveal = false;
         slot.IsVisible = true;
 
-        if (_overlaySuppressed)
+        if (IsSlotChromeSuppressed(slot))
         {
-            // A modal/dialog is currently suppressing all native video pixels.
+            // A modal/dialog or pane drag-swap is suppressing native video pixels.
             // We still flip `IsVisible` so that SuppressForOverlayAsync(false) will
             // restore this slot when the modal closes, but we must NOT paint bounds
             // or opacity here — otherwise the freshly-Playing video would pop up
@@ -372,7 +372,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
     // a bounds observer no-op). Safe to call frequently; cheap when already correct.
     private void ReconcileSlotChromeLocked(VideoSlot slot, string reason)
     {
-        if (slot.MediaElement is null || !slot.HasPlayableBounds || _overlaySuppressed)
+        if (slot.MediaElement is null || !slot.HasPlayableBounds || IsSlotChromeSuppressed(slot))
         {
             return;
         }
@@ -413,6 +413,62 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
     // suppression simply flips the logical visibility without exposing pixels.
     // The opacity/bounds are then restored together on unsuppress.
     private volatile bool _overlaySuppressed;
+    private readonly HashSet<int> _paneSwapSuppressedSlots = [];
+
+    public Rect GetLastBounds(int slotIndex) =>
+        TryGetSlot(slotIndex, out var slot) ? slot.LastBounds : HiddenBounds;
+
+    public bool IsPaneSwapSuppressed(int slotIndex) => _paneSwapSuppressedSlots.Contains(slotIndex);
+
+    // Per-slot suppression during pane drag-swap. The native SwapChainPanel blocks
+    // WebView hit-testing; hiding the source slot exposes the holdover/dim CSS, and
+    // hiding video targets lets elementFromPoint resolve drop targets during drag.
+    public Task SetPaneSwapSuppressedAsync(int slotIndex, bool suppress)
+    {
+        if (!TryGetSlot(slotIndex, out var slot))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (suppress)
+        {
+            if (!_paneSwapSuppressedSlots.Add(slotIndex))
+            {
+                return Task.CompletedTask;
+            }
+        }
+        else if (!_paneSwapSuppressedSlots.Remove(slotIndex))
+        {
+            return Task.CompletedTask;
+        }
+
+        return MainThread.InvokeOnMainThreadAsync(() => ReconcileSlotChromeLocked(slot, suppress ? "pane-swap-suppress" : "pane-swap-unsuppress"));
+    }
+
+    public Task ClearPaneSwapSuppressionAsync()
+    {
+        if (_paneSwapSuppressedSlots.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        var slots = _paneSwapSuppressedSlots.ToArray();
+        _paneSwapSuppressedSlots.Clear();
+
+        return MainThread.InvokeOnMainThreadAsync(() =>
+        {
+            foreach (var slotIndex in slots)
+            {
+                if (TryGetSlot(slotIndex, out var slot))
+                {
+                    ReconcileSlotChromeLocked(slot, "pane-swap-clear");
+                }
+            }
+        });
+    }
+
+    private bool IsSlotChromeSuppressed(VideoSlot slot) =>
+        _overlaySuppressed || _paneSwapSuppressedSlots.Contains(slot.Index);
 
     public Task SuppressForOverlayAsync(bool suppress)
     {
@@ -510,9 +566,14 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
             return;
         }
 
-        // Image/GIF slots that were already idle skip Stop/ClearValue — every image
-        // swap was tearing down the native surface and nudging sibling video panes.
-        var needsTeardown = slot.IsVisible || slot.PlayWhenReady || slot.CurrentPath is not null;
+        // Always stop when this pane leaves video. Skipping teardown when IsVisible
+        // was false let the native element keep playing under a Blazor image, which
+        // desynced progress logs and made videos appear to run past their slot advance.
+        var needsTeardown = slot.PlayWhenReady
+            || slot.HasObservedPlayback
+            || slot.CurrentPath is not null
+            || slot.PendingItem?.Kind == MediaKind.Video;
+
         if (!needsTeardown)
         {
             ClearPendingSlotPlayback(slot);
@@ -662,6 +723,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
                 slot.EndSignaled = false;
                 slot.ProgressEndCheckArmed = false;
                 slot.HasObservedPlayback = false;
+                slot.PlaybackObservedAt = null;
                 slot.SourceLoadAcknowledged = false;
                 slot.StoppedStateStartedAt = null;
                 slot.PausedStateStartedAt = null;
@@ -697,7 +759,10 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
                 });
                 PublishProgressResetIfPrimary(slot);
                 var reason = isSourceChange ? "source-change" : "same-source-restart";
-                debugLog.Info($"Native video media loaded: slot={slot.Index}; generation={generation}; reason={reason}; file={item.DisplayName}; path={item.FilePath}");
+                var probedHint = videoMetadata.TryGetDuration(item.FilePath, out var probedDuration) && probedDuration.TotalSeconds > 0.5
+                    ? $"probed={probedDuration.TotalSeconds:0.###}s"
+                    : "probed=pending";
+                debugLog.Info($"Native video media loaded: slot={slot.Index}; generation={generation}; reason={reason}; {probedHint}; file={item.DisplayName}; path={item.FilePath}");
                 PlaybackStarted?.Invoke(slot.Index, item.FilePath, generation);
                 TryStartSlotPlayback(slot, settings, reason);
             }
@@ -1209,6 +1274,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         if (state == MediaElementState.Playing)
         {
             slot.HasObservedPlayback = true;
+            slot.PlaybackObservedAt ??= DateTimeOffset.UtcNow;
             slot.StartupRetryCount = 0;
             slot.PausedStateStartedAt = null;
             // The new source is actually rendering frames now. This is the right
@@ -1352,7 +1418,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         if (slot.StoppedStateStartedAt is null)
         {
             slot.StoppedStateStartedAt = now;
-            debugLog.Trace($"Native video stopped without completion event; waiting before signaling end: slot={slot.Index}; reason={reason}; position={position.TotalSeconds:0.###}s; duration={elementDuration.TotalSeconds:0.###}s; effective={effectiveDuration.TotalSeconds:0.###}s; cachedEnd={nearCachedEnd}; file={Path.GetFileName(slot.CurrentPath)}.");
+            debugLog.Trace($"Native video stopped without completion event; waiting before signaling end: slot={slot.Index}; reason={reason}; {PlaybackDiagnostics.FormatTimeline(position, effectiveDuration)}; elementDur={elementDuration.TotalSeconds:0.###}s; cachedEnd={nearCachedEnd}; {PlaybackDiagnostics.FormatWallElapsed(slot.PlaybackObservedAt)}; file={Path.GetFileName(slot.CurrentPath)}.");
             return;
         }
 
@@ -1376,7 +1442,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         }
 
         slot.LastProgressLogAt = now;
-        debugLog.Trace($"Native video progress: slot={slot.Index}; position={position.TotalSeconds:0.###}s; duration={duration.TotalSeconds:0.###}s; state={state}; generation={slot.PlaybackGeneration}; endArmed={slot.ProgressEndCheckArmed}; playWhenReady={slot.PlayWhenReady}; endSignaled={slot.EndSignaled}; file={Path.GetFileName(slot.CurrentPath)}.");
+        debugLog.Trace($"Native video progress: slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}; {PlaybackDiagnostics.FormatWallElapsed(slot.PlaybackObservedAt)}; state={state}; generation={slot.PlaybackGeneration}; endArmed={slot.ProgressEndCheckArmed}; playWhenReady={slot.PlayWhenReady}; endSignaled={slot.EndSignaled}; file={Path.GetFileName(slot.CurrentPath)}.");
     }
 
     private void PublishProgressResetIfPrimary(VideoSlot slot)
@@ -1540,7 +1606,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
             if (position.TotalSeconds > 0.05 && position.TotalSeconds < duration.TotalSeconds - 0.5)
             {
                 slot.ProgressEndCheckArmed = true;
-                debugLog.Trace($"Native video progress end-check armed: slot={slot.Index}; position={position.TotalSeconds:0.###}s; duration={duration.TotalSeconds:0.###}s.");
+                debugLog.Trace($"Native video progress end-check armed: slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}; {PlaybackDiagnostics.FormatWallElapsed(slot.PlaybackObservedAt)}.");
             }
 
             return;
@@ -1548,13 +1614,13 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
 
         if (position.TotalSeconds >= duration.TotalSeconds - 0.25)
         {
-            debugLog.Trace($"Native video reached duration by progress polling: slot={slot.Index}; position={position.TotalSeconds:0.###}s; duration={duration.TotalSeconds:0.###}s.");
+            debugLog.Trace($"Native video reached duration by progress polling: slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}; {PlaybackDiagnostics.FormatWallElapsed(slot.PlaybackObservedAt)}.");
             StopProgressTimer(slot);
-            SignalEndReached(slot, "progress-duration");
+            SignalEndReached(slot, "progress-duration", position, duration);
         }
     }
 
-    private void SignalEndReached(VideoSlot slot, string reason)
+    private void SignalEndReached(VideoSlot slot, string reason, TimeSpan? position = null, TimeSpan? duration = null)
     {
         if (slot.EndSignaled)
         {
@@ -1565,7 +1631,27 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         slot.PlayWhenReady = false;
         var completedPath = slot.CurrentPath;
         var completedGeneration = slot.PlaybackGeneration;
-        debugLog.Debug($"Native video completion signaled: slot={slot.Index}; generation={completedGeneration}; reason={reason}; file={Path.GetFileName(completedPath)}.");
+
+        if (position is null || duration is null)
+        {
+            if (slot.MediaElement is not null
+                && TryReadPlaybackSnapshot(slot.MediaElement, out var snapPosition, out var snapDuration, out _))
+            {
+                position = snapPosition;
+                duration = snapDuration;
+            }
+        }
+
+        var timeline = position is { } pos && duration is { } dur
+            ? PlaybackDiagnostics.FormatTimeline(pos, dur)
+            : "pos/dur=unknown";
+        var probed = completedPath is not null
+                     && videoMetadata.TryGetDuration(completedPath, out var metaDuration)
+                     && metaDuration.TotalSeconds > 0.5
+            ? $"probed={metaDuration.TotalSeconds:0.###}s"
+            : "probed=—";
+
+        debugLog.Debug($"Native video completion signaled: slot={slot.Index}; generation={completedGeneration}; reason={reason}; {timeline}; {probed}; {PlaybackDiagnostics.FormatWallElapsed(slot.PlaybackObservedAt)}; file={Path.GetFileName(completedPath)}.");
         _ = Task.Run(() => EndReached?.Invoke(slot.Index, completedPath, completedGeneration, reason));
     }
 
@@ -1661,6 +1747,8 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         public int StartupRetryCount { get; set; }
 
         public DateTimeOffset LastProgressLogAt { get; set; } = DateTimeOffset.MinValue;
+
+        public DateTimeOffset? PlaybackObservedAt { get; set; }
 
         public DateTimeOffset IgnoreEndedEventsUntil { get; set; } = DateTimeOffset.MinValue;
 

@@ -16,9 +16,16 @@ public sealed class PlaybackSettings
     public const int MinGifRepeatCount = 1;
     public const int MaxGifRepeatCount = 100;
     public const int DefaultGifRepeatCount = 5;
-    public const int MinFavoriteShuffleWeight = 1;
-    public const int MaxFavoriteShuffleWeight = 5;
-    public const int DefaultFavoriteShuffleWeight = 3;
+    public const double MinFavoriteShuffleWeight = 1;
+    public const double MaxFavoriteShuffleWeight = 5;
+    public const double DefaultFavoriteShuffleWeight = 2;
+    public const double MinDislikeShuffleWeight = 1;
+    public const double MaxDislikeShuffleWeight = 5;
+    /// <summary>Default 1× keeps prior behavior: disliked items are hidden from shuffle.</summary>
+    public const double DefaultDislikeShuffleWeight = 1;
+    public const double MinSuperLikeShuffleWeight = 1;
+    public const double MaxSuperLikeShuffleWeight = 10;
+    public const double DefaultSuperLikeShuffleWeight = 4;
 
     public double PlaybackSpeed { get; set; } = DefaultPlaybackSpeed;
 
@@ -52,7 +59,38 @@ public sealed class PlaybackSettings
 
     public bool BoostFavoritesInShuffle { get; set; } = true;
 
-    public int FavoriteShuffleWeight { get; set; } = DefaultFavoriteShuffleWeight;
+    public double FavoriteShuffleWeight { get; set; } = DefaultFavoriteShuffleWeight;
+
+    public bool PenalizeDislikesInShuffle { get; set; } = true;
+
+    /// <summary>
+    /// Shuffle frequency for disliked items (1–5). 1× hides them; higher values add more copies to the shuffle bag.
+    /// </summary>
+    public double DislikeShuffleWeight { get; set; } = DefaultDislikeShuffleWeight;
+
+    public bool BoostSuperLikesInShuffle { get; set; } = true;
+
+    public double SuperLikeShuffleWeight { get; set; } = DefaultSuperLikeShuffleWeight;
+
+    public bool BackButtonRemovesDislike { get; set; } = true;
+
+    public bool StaggerPaneTransitions { get; set; } = true;
+
+    public int GetDislikedShuffleCopyCount()
+    {
+        if (!PenalizeDislikesInShuffle)
+        {
+            return 1;
+        }
+
+        var frequency = Math.Clamp(DislikeShuffleWeight, MinDislikeShuffleWeight, MaxDislikeShuffleWeight);
+        return Math.Max(0, (int)Math.Round(frequency - MinDislikeShuffleWeight));
+    }
+
+    public double GetDislikedShuffleDisplayFrequency() =>
+        PenalizeDislikesInShuffle
+            ? Math.Clamp(DislikeShuffleWeight, MinDislikeShuffleWeight, MaxDislikeShuffleWeight)
+            : MaxDislikeShuffleWeight;
 
     public PlaybackMediaKinds EnabledMediaKinds { get; set; } = PlaybackMediaKinds.All;
 
@@ -132,6 +170,12 @@ public sealed class PlaybackSettings
         builder.Append(CultureInfo.InvariantCulture, $"; enabledMediaKinds={EnabledMediaKinds}");
         builder.Append(CultureInfo.InvariantCulture, $"; boostFavorites={BoostFavoritesInShuffle}");
         builder.Append(CultureInfo.InvariantCulture, $"; favoriteWeight={FavoriteShuffleWeight}");
+        builder.Append(CultureInfo.InvariantCulture, $"; penalizeDislikes={PenalizeDislikesInShuffle}");
+        builder.Append(CultureInfo.InvariantCulture, $"; dislikeWeight={DislikeShuffleWeight}");
+        builder.Append(CultureInfo.InvariantCulture, $"; dislikeCopies={GetDislikedShuffleCopyCount()}");
+        builder.Append(CultureInfo.InvariantCulture, $"; boostSuperLikes={BoostSuperLikesInShuffle}");
+        builder.Append(CultureInfo.InvariantCulture, $"; superLikeWeight={SuperLikeShuffleWeight}");
+        builder.Append(CultureInfo.InvariantCulture, $"; backButtonRemovesDislike={BackButtonRemovesDislike}");
         builder.Append(CultureInfo.InvariantCulture, $"; recursiveFolderScan={RecursiveFolderScan}");
         builder.Append(CultureInfo.InvariantCulture, $"; split={SplitScreenMode}");
         builder.Append(CultureInfo.InvariantCulture, $"; splitCount={SplitScreenCount}");

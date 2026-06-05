@@ -3,6 +3,7 @@ using MauiMediaPlayer.Models;
 #if WINDOWS
 using MauiMediaPlayer.Platforms.Windows;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Input;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
 #endif
@@ -12,27 +13,38 @@ namespace MauiMediaPlayer;
 public partial class MainPage : ContentPage
 {
 	private const int NativeTapDelayMilliseconds = 280;
+	private const int NativeVideoSlotCount = 3;
 	private readonly NativeVideoPlaybackService _nativeVideoPlayback;
+	private readonly NativePaneSwapDragBridgeService _nativePaneSwapBridge;
 	private readonly PlaybackService _playback;
 	private readonly IFullscreenService _fullscreen;
 	private readonly DebugLogService _debugLog;
 	private readonly FullPathDropService _fullPathDrop;
+	private readonly View[] _nativeVideoElements;
+	private readonly double?[] _nativePressClientX = new double?[NativeVideoSlotCount];
+	private readonly double?[] _nativePressClientY = new double?[NativeVideoSlotCount];
+	private readonly bool[] _nativePointerHooked = new bool[NativeVideoSlotCount];
+	private readonly bool[] _nativePanSessionActive = new bool[NativeVideoSlotCount];
+	private readonly bool[] _nativePanPending = new bool[NativeVideoSlotCount];
+	private const double NativePaneDragThresholdPx = 8;
 	private CancellationTokenSource? _nativeTapCancellation;
-	private int _nativeTapCount;
 
 	public MainPage(
 		NativeVideoPlaybackService nativeVideoPlayback,
+		NativePaneSwapDragBridgeService nativePaneSwapBridge,
 		PlaybackService playback,
 		IFullscreenService fullscreen,
 		DebugLogService debugLog,
 		FullPathDropService fullPathDrop)
 	{
 		_nativeVideoPlayback = nativeVideoPlayback;
+		_nativePaneSwapBridge = nativePaneSwapBridge;
 		_playback = playback;
 		_fullscreen = fullscreen;
 		_debugLog = debugLog;
 		_fullPathDrop = fullPathDrop;
 		InitializeComponent();
+		_nativeVideoElements = [nativeVideoElement0, nativeVideoElement1, nativeVideoElement2];
 #if WINDOWS
 		Loaded += OnPageLoadedForWindowsDrop;
 #endif
@@ -40,6 +52,13 @@ public partial class MainPage : ContentPage
 		nativeVideoElement1.Loaded += OnNativeVideoElementLoaded;
 		nativeVideoElement2.Loaded += OnNativeVideoElementLoaded;
 		RegisterNativeVideoGestures();
+		_nativePaneSwapBridge.NativeDragArmed += CancelPendingNativeTap;
+	}
+
+	private void CancelPendingNativeTap()
+	{
+		_nativeTapCancellation?.Cancel();
+		_nativeTapCount = 0;
 	}
 
 	private void OnNativeVideoElementLoaded(object? sender, EventArgs e)
@@ -63,12 +82,13 @@ public partial class MainPage : ContentPage
 
 	private void RegisterNativeVideoGestures()
 	{
-		RegisterNativeVideoGesture(nativeVideoElement0);
-		RegisterNativeVideoGesture(nativeVideoElement1);
-		RegisterNativeVideoGesture(nativeVideoElement2);
+		for (var slotIndex = 0; slotIndex < NativeVideoSlotCount; slotIndex++)
+		{
+			RegisterNativeVideoGesture(_nativeVideoElements[slotIndex], slotIndex);
+		}
 	}
 
-	private void RegisterNativeVideoGesture(View view)
+	private void RegisterNativeVideoGesture(View view, int slotIndex)
 	{
 		var tapGesture = new TapGestureRecognizer
 		{
@@ -77,6 +97,139 @@ public partial class MainPage : ContentPage
 
 		tapGesture.Tapped += OnNativeVideoTapped;
 		view.GestureRecognizers.Add(tapGesture);
+
+		var panGesture = new PanGestureRecognizer();
+		panGesture.PanUpdated += (_, args) => OnNativeVideoPanUpdated(slotIndex, args);
+		view.GestureRecognizers.Add(panGesture);
+
+#if WINDOWS
+		view.HandlerChanged += (_, _) => AttachWindowsPointerTracking(view, slotIndex);
+#endif
+	}
+
+	private int _nativeTapCount;
+
+#if WINDOWS
+	private void AttachWindowsPointerTracking(View view, int slotIndex)
+	{
+		if (_nativePointerHooked[slotIndex] || view.Handler?.PlatformView is not FrameworkElement element)
+		{
+			return;
+		}
+
+		_nativePointerHooked[slotIndex] = true;
+		element.PointerPressed += (_, args) => OnNativeVideoPointerPressed(slotIndex, element, args);
+	}
+
+	private void OnNativeVideoPointerPressed(int slotIndex, FrameworkElement target, PointerRoutedEventArgs args)
+	{
+		if (!_nativePaneSwapBridge.CanDrag)
+		{
+			return;
+		}
+
+		var local = args.GetCurrentPoint(target).Position;
+		var bounds = _nativeVideoPlayback.GetLastBounds(slotIndex);
+		_nativePressClientX[slotIndex] = bounds.X + local.X;
+		_nativePressClientY[slotIndex] = bounds.Y + local.Y;
+	}
+#endif
+
+	private async void OnNativeVideoPanUpdated(int slotIndex, PanUpdatedEventArgs args)
+	{
+		if (!_nativePaneSwapBridge.CanDrag)
+		{
+			return;
+		}
+
+		try
+		{
+			switch (args.StatusType)
+			{
+				case GestureStatus.Started:
+					_nativePanPending[slotIndex] = true;
+					_nativePanSessionActive[slotIndex] = false;
+					break;
+
+				case GestureStatus.Running:
+					if (!_nativePanPending[slotIndex])
+					{
+						return;
+					}
+
+					var runningX = ResolveNativePressClientX(slotIndex) + args.TotalX;
+					var runningY = ResolveNativePressClientY(slotIndex) + args.TotalY;
+					var startX = ResolveNativePressClientX(slotIndex);
+					var startY = ResolveNativePressClientY(slotIndex);
+					var dx = runningX - startX;
+					var dy = runningY - startY;
+
+					if (!_nativePanSessionActive[slotIndex])
+					{
+						if (dx * dx + dy * dy < NativePaneDragThresholdPx * NativePaneDragThresholdPx)
+						{
+							return;
+						}
+
+						_nativePanSessionActive[slotIndex] = true;
+						await _nativePaneSwapBridge.TryStartNativePanAsync(slotIndex, startX, startY);
+					}
+
+					await _nativePaneSwapBridge.UpdateNativePanAsync(slotIndex, runningX, runningY);
+					break;
+
+				case GestureStatus.Completed:
+				case GestureStatus.Canceled:
+					if (!_nativePanPending[slotIndex])
+					{
+						return;
+					}
+
+					_nativePanPending[slotIndex] = false;
+
+					if (_nativePanSessionActive[slotIndex])
+					{
+						var finalX = ResolveNativePressClientX(slotIndex) + args.TotalX;
+						var finalY = ResolveNativePressClientY(slotIndex) + args.TotalY;
+						await _nativePaneSwapBridge.CompleteNativePanAsync(
+							slotIndex,
+							finalX,
+							finalY,
+							args.StatusType == GestureStatus.Canceled);
+					}
+
+					_nativePanSessionActive[slotIndex] = false;
+					_nativePressClientX[slotIndex] = null;
+					_nativePressClientY[slotIndex] = null;
+					break;
+			}
+		}
+		catch (Exception exception)
+		{
+			_debugLog.Error($"Native video pan handling failed for slot {slotIndex + 1}: {exception.Message}");
+		}
+	}
+
+	private double ResolveNativePressClientX(int slotIndex)
+	{
+		if (_nativePressClientX[slotIndex] is { } stored)
+		{
+			return stored;
+		}
+
+		var bounds = _nativeVideoPlayback.GetLastBounds(slotIndex);
+		return bounds.X + (bounds.Width * 0.5);
+	}
+
+	private double ResolveNativePressClientY(int slotIndex)
+	{
+		if (_nativePressClientY[slotIndex] is { } stored)
+		{
+			return stored;
+		}
+
+		var bounds = _nativeVideoPlayback.GetLastBounds(slotIndex);
+		return bounds.Y + (bounds.Height * 0.5);
 	}
 
 	private async void OnNativeVideoTapped(object? sender, TappedEventArgs args)

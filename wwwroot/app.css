@@ -713,6 +713,24 @@ h1:focus {
     justify-content: space-between;
 }
 
+.playlist-toolbar-actions-row {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    min-width: 0;
+}
+
+.playlist-sort-select {
+    max-width: 9rem;
+}
+
+.playlist-clear-dislikes-btn,
+.playlist-clear-superlikes-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
 .playlist-filter-chips {
     display: flex;
     gap: 0.25rem;
@@ -791,11 +809,46 @@ h1:focus {
     outline-offset: -2px;
 }
 
-.playlist-item-favorite {
+.playlist-item-marks {
     align-items: center;
-    color: var(--brand, #e74c3c);
     display: flex;
     flex: 0 0 auto;
+    gap: 0.125rem;
+    padding-left: 0.5rem;
+}
+
+.playlist-item-mark {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    display: flex;
+    flex: 0 0 auto;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    width: 26px;
+}
+
+.playlist-item-mark:hover {
+    background: rgba(0, 0, 0, 0.06);
+}
+
+.playlist-item.is-current .playlist-item-mark:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.playlist-item-mark-favorite {
+    color: var(--brand, #e74c3c);
+}
+
+.playlist-item-mark-disliked {
+    color: #f87171;
+}
+
+.playlist-item-mark-superliked {
+    color: #f59e0b;
 }
 
 .playlist-item-icon {
@@ -881,6 +934,36 @@ h1:focus {
     position: relative;
 }
 
+.media-pause-overlay {
+    align-items: center;
+    background: rgba(0, 0, 0, 0.28);
+    border: 0;
+    cursor: pointer;
+    display: flex;
+    inset: 0;
+    justify-content: center;
+    position: absolute;
+    z-index: 6;
+}
+
+.media-pause-overlay-icon {
+    align-items: center;
+    color: rgba(255, 255, 255, 0.72);
+    display: flex;
+    filter: drop-shadow(0 2px 12px rgba(0, 0, 0, 0.45));
+    justify-content: center;
+    transition: color 0.15s ease, transform 0.15s ease;
+}
+
+.media-pause-overlay:hover .media-pause-overlay-icon {
+    color: rgba(255, 255, 255, 0.92);
+    transform: scale(1.06);
+}
+
+.media-pause-overlay-icon.is-pause-flash {
+    color: rgba(255, 255, 255, 0.95);
+}
+
 .media-viewport.is-drag-over::after {
     border: 2px dashed var(--brand);
     border-radius: var(--radius-md);
@@ -953,6 +1036,8 @@ h1:focus {
    the clip always matches the live caption height (including any future font
    or padding tweaks). Falls back to 0 if JS hasn't measured yet, which simply
    leaves the bleed on first paint until the first bounds update. */
+.media-pane.is-video-pane .media-pane-zoom-layer .media-image-holdover,
+.media-pane.is-video-pane .media-pane-zoom-layer .native-video-placeholder,
 .media-pane.is-video-pane .media-image-holdover,
 .media-pane.is-video-pane .native-video-placeholder {
     clip-path: inset(0 0 var(--caption-inset, 0px) 0);
@@ -989,9 +1074,10 @@ h1:focus {
        always matches the live caption box. The fallback prevents a flash of
        holdover bleed on the very first paint, before JS has measured. */
     --caption-inset: 3rem;
-    align-items: center;
+    align-items: stretch;
     background: #000;
     display: flex;
+    flex-direction: column;
     justify-content: center;
     min-height: 0;
     min-width: 0;
@@ -1040,6 +1126,42 @@ h1:focus {
     text-transform: uppercase;
 }
 
+.media-dislike-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    display: inline-flex;
+    flex-shrink: 0;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+    width: 26px;
+}
+
+.media-dislike-btn .bi {
+    display: block;
+    flex-shrink: 0;
+}
+
+.media-dislike-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+}
+
+.media-dislike-btn.is-disliked {
+    background: rgba(239, 68, 68, 0.22);
+    color: #f87171;
+}
+
+.media-dislike-btn.is-disliked:hover {
+    background: rgba(239, 68, 68, 0.38);
+    color: #fff;
+}
+
 .media-favorite-btn {
     align-items: center;
     background: rgba(255, 255, 255, 0.10);
@@ -1076,6 +1198,45 @@ h1:focus {
     color: #fff;
 }
 
+/* Super-like button mirrors .media-favorite-btn structure but uses an orange/amber
+   active tint so it reads as a distinct tier above favorites. The icon is rendered
+   at the same 18px size as the favorite button for visual parity in the toolbar. */
+.media-superlike-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    display: inline-flex;
+    flex-shrink: 0;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+    width: 26px;
+}
+
+.media-superlike-btn .bi {
+    display: block;
+    flex-shrink: 0;
+}
+
+.media-superlike-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+}
+
+.media-superlike-btn.is-superliked {
+    background: rgba(245, 158, 11, 0.22);
+    color: #fbbf24;
+}
+
+.media-superlike-btn.is-superliked:hover {
+    background: rgba(245, 158, 11, 0.42);
+    color: #fff;
+}
+
 .media-skip-btn {
     align-items: center;
     background: rgba(255, 255, 255, 0.10);
@@ -1091,8 +1252,247 @@ h1:focus {
     width: 26px;
 }
 
-.media-skip-btn:hover {
+.media-skip-btn:hover:not(:disabled) {
     background: var(--brand);
+}
+
+.media-skip-btn:disabled {
+    cursor: default;
+    opacity: 0.35;
+    pointer-events: none;
+}
+
+.media-back-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: #fff;
+    cursor: pointer;
+    display: inline-flex;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast), opacity var(--transition-fast);
+    width: 26px;
+}
+
+.media-back-btn:hover:not(:disabled) {
+    background: var(--brand);
+}
+
+.media-back-btn:disabled {
+    cursor: default;
+    opacity: 0.35;
+    pointer-events: none;
+}
+
+.media-lock-btn {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.10);
+    border: 0;
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.9);
+    cursor: pointer;
+    display: inline-flex;
+    flex-shrink: 0;
+    height: 26px;
+    justify-content: center;
+    padding: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
+    width: 26px;
+}
+
+.media-lock-btn:hover {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+}
+
+.media-lock-btn.is-locked {
+    background: var(--brand-soft);
+    color: var(--brand);
+}
+
+.media-lock-btn.is-locked:hover {
+    background: var(--brand);
+    color: #fff;
+}
+
+.media-pane.is-locked {
+    box-shadow: inset 0 0 0 2px var(--brand-soft);
+}
+
+/* Zoom layer wraps the visual content (images, holdovers, native-video placeholder)
+   inside each pane so wheel-zoom can apply a CSS transform without scaling the
+   caption or status badges. JS sets `transform-origin` inline at wheel time so the
+   zoom anchors at the cursor; the transition only kicks in during the explicit
+   reset path (`.is-resetting`) so live wheel scrolling stays jitter-free. The
+   layer keeps default pointer-events so it can receive pointerdown for
+   pane-drag-swap; drop targets are hit-tested in JS during the drag. Wheel
+   events bubble up to the pane root (where the JS
+   wheel listener lives), and the inner <img>/placeholder don't intercept clicks. */
+.media-pane-zoom-layer {
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    left: 0;
+    position: absolute;
+    right: 0;
+    top: 0;
+    transform-origin: 50% 50%;
+    width: 100%;
+    will-change: transform;
+    z-index: 0;
+}
+
+.media-pane-zoom-layer.is-resetting {
+    transition: transform 160ms ease-out;
+}
+
+.media-pane.is-zoomed {
+    cursor: zoom-in;
+}
+
+/* Non-interactive active-state badges anchored to the top-right of each pane.
+   Always painted (not just on hover) but heavily muted so they don't compete
+   with the media; hover bumps the opacity to ~0.85. pointer-events: none keeps
+   them out of the pause overlay / drag handlers. z-index sits between the zoom
+   layer (0) and the caption (3), below the pause overlay (6) and drag ghost (1000). */
+.media-pane-status {
+    align-items: center;
+    display: flex;
+    gap: 0.75rem;
+    opacity: 0.35;
+    pointer-events: none;
+    position: absolute;
+    right: 0.5rem;
+    top: 0.5rem;
+    transition: opacity var(--transition-fast);
+    z-index: 2;
+}
+
+.media-pane:hover .media-pane-status {
+    opacity: 0.85;
+}
+
+.media-pane-status-icon {
+    align-items: center;
+    color: rgba(255, 255, 255, 0.78);
+    display: inline-flex;
+    filter: drop-shadow(0 3px 3px rgba(0, 0, 0, 0.55));
+    flex-shrink: 0;
+    height: 42px;
+    justify-content: center;
+    width: 42px;
+}
+
+.media-pane-status-superlike {
+    color: #fbbf24;
+}
+
+.media-pane-status-favorite {
+    color: #c4b5fd;
+}
+
+.media-pane-status-dislike {
+    color: #fca5a5;
+}
+
+.media-pane-status-lock {
+    color: rgba(255, 255, 255, 0.88);
+}
+
+/* Pane drag-swap visuals. The source pane dims its zoom-layer content while the
+   ghost (a fixed, semi-transparent silhouette) follows the cursor. Drop targets
+   gain a brand-tinted ring. Cursor changes (grab/grabbing) communicate that the
+   pane is draggable while multi-split is active. */
+.media-viewport.is-pane-swap-active {
+    cursor: grabbing;
+}
+
+.media-viewport.is-pane-swap-active .media-pane,
+.media-viewport.is-pane-swap-active .media-pane-zoom-layer {
+    cursor: grabbing;
+}
+
+.media-split.media-split-2 .media-pane-zoom-layer,
+.media-split.media-split-3 .media-pane-zoom-layer {
+    cursor: grab;
+}
+
+.media-pane.is-pane-drag-source .media-pane-zoom-layer {
+    opacity: 0.45;
+}
+
+.media-pane.is-pane-drop-target {
+    box-shadow: inset 0 0 0 2px var(--brand);
+}
+
+.media-pane.is-pane-drop-target::after {
+    background: rgba(124, 58, 237, 0.08);
+    content: "";
+    inset: 0;
+    pointer-events: none;
+    position: absolute;
+    z-index: 4;
+}
+
+.media-pane-drag-ghost {
+    background: rgba(0, 0, 0, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-elev-3);
+    color: rgba(255, 255, 255, 0.85);
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 165px;
+    max-width: 220px;
+    min-height: 90px;
+    min-width: 120px;
+    opacity: 0.55;
+    overflow: hidden;
+    padding: 0.35rem;
+    pointer-events: none;
+    position: fixed;
+    transform: scale(0.95);
+    transform-origin: top left;
+    z-index: 1000;
+}
+
+.media-pane-drag-ghost img {
+    border-radius: var(--radius-sm);
+    flex: 1;
+    min-height: 0;
+    object-fit: contain;
+    width: 100%;
+}
+
+.media-pane-drag-ghost-fallback {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.55);
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 0.35rem;
+    justify-content: center;
+    min-height: 0;
+    padding: 0.5rem;
+    text-align: center;
+    width: 100%;
+}
+
+.media-pane-drag-ghost-title {
+    color: rgba(255, 255, 255, 0.78);
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 100%;
 }
 
 .is-fullscreen .media-caption {

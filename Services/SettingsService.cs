@@ -21,6 +21,11 @@ public sealed class SettingsService
     private const string PlaylistSourceKey = "playlist-source";
     private const string BoostFavoritesInShuffleKey = "boost-favorites-in-shuffle";
     private const string FavoriteShuffleWeightKey = "favorite-shuffle-weight";
+    private const string PenalizeDislikesInShuffleKey = "penalize-dislikes-in-shuffle";
+    private const string DislikeShuffleWeightKey = "dislike-shuffle-weight";
+    private const string BoostSuperLikesInShuffleKey = "boost-superlikes-in-shuffle";
+    private const string SuperLikeShuffleWeightKey = "superlike-shuffle-weight";
+    private const string BackButtonRemovesDislikeKey = "back-button-removes-dislike";
     private const string EnabledMediaKindsKey = "enabled-media-kinds";
     private const string LibraryResumePositionsKey = "library-resume-positions";
     private const string RecentPathsKey = "recent-paths";
@@ -57,6 +62,11 @@ public sealed class SettingsService
                 : PlaylistSource.AllLibrary,
             BoostFavoritesInShuffle = Preferences.Default.Get(BoostFavoritesInShuffleKey, true),
             FavoriteShuffleWeight = Preferences.Default.Get(FavoriteShuffleWeightKey, PlaybackSettings.DefaultFavoriteShuffleWeight),
+            PenalizeDislikesInShuffle = Preferences.Default.Get(PenalizeDislikesInShuffleKey, true),
+            DislikeShuffleWeight = Preferences.Default.Get(DislikeShuffleWeightKey, PlaybackSettings.DefaultDislikeShuffleWeight),
+            BoostSuperLikesInShuffle = Preferences.Default.Get(BoostSuperLikesInShuffleKey, true),
+            SuperLikeShuffleWeight = Preferences.Default.Get(SuperLikeShuffleWeightKey, PlaybackSettings.DefaultSuperLikeShuffleWeight),
+            BackButtonRemovesDislike = Preferences.Default.Get(BackButtonRemovesDislikeKey, true),
             EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(
                 (PlaybackMediaKinds)Preferences.Default.Get(EnabledMediaKindsKey, (int)PlaybackMediaKinds.All))
         };
@@ -72,6 +82,14 @@ public sealed class SettingsService
             settings.FavoriteShuffleWeight,
             PlaybackSettings.MinFavoriteShuffleWeight,
             PlaybackSettings.MaxFavoriteShuffleWeight);
+        settings.DislikeShuffleWeight = Math.Clamp(
+            settings.DislikeShuffleWeight,
+            PlaybackSettings.MinDislikeShuffleWeight,
+            PlaybackSettings.MaxDislikeShuffleWeight);
+        settings.SuperLikeShuffleWeight = Math.Clamp(
+            settings.SuperLikeShuffleWeight,
+            PlaybackSettings.MinSuperLikeShuffleWeight,
+            PlaybackSettings.MaxSuperLikeShuffleWeight);
         settings.EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(settings.EnabledMediaKinds);
 
         return Task.FromResult(settings);
@@ -97,6 +115,15 @@ public sealed class SettingsService
         Preferences.Default.Set(
             FavoriteShuffleWeightKey,
             Math.Clamp(settings.FavoriteShuffleWeight, PlaybackSettings.MinFavoriteShuffleWeight, PlaybackSettings.MaxFavoriteShuffleWeight));
+        Preferences.Default.Set(PenalizeDislikesInShuffleKey, settings.PenalizeDislikesInShuffle);
+        Preferences.Default.Set(
+            DislikeShuffleWeightKey,
+            Math.Clamp(settings.DislikeShuffleWeight, PlaybackSettings.MinDislikeShuffleWeight, PlaybackSettings.MaxDislikeShuffleWeight));
+        Preferences.Default.Set(BoostSuperLikesInShuffleKey, settings.BoostSuperLikesInShuffle);
+        Preferences.Default.Set(
+            SuperLikeShuffleWeightKey,
+            Math.Clamp(settings.SuperLikeShuffleWeight, PlaybackSettings.MinSuperLikeShuffleWeight, PlaybackSettings.MaxSuperLikeShuffleWeight));
+        Preferences.Default.Set(BackButtonRemovesDislikeKey, settings.BackButtonRemovesDislike);
         Preferences.Default.Set(
             EnabledMediaKindsKey,
             (int)PlaybackSettings.NormalizeEnabledMediaKinds(settings.EnabledMediaKinds));

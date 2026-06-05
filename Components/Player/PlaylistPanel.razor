@@ -2,6 +2,8 @@
 @inject PlaylistService Playlist
 @inject PlaybackService Playback
 @inject FavoritesService Favorites
+@inject DislikesService Dislikes
+@inject SuperLikesService SuperLikes
 @inject IFileSystemActionsService FileSystemActions
 @inject ToastService Toasts
 @using MauiMediaPlayer.Models
@@ -77,10 +79,9 @@
         </div>
 
         <div class="playlist-toolbar-actions">
-            <div class="d-flex align-items-center gap-1">
-                <select class="form-select form-select-sm"
+            <div class="playlist-toolbar-actions-row">
+                <select class="form-select form-select-sm playlist-sort-select"
                         value="@_sortMode"
-                        style="max-width:9rem;"
                         @onchange="SetSortAsync"
                         aria-label="Sort order">
                     <option value="@SortMode.Name">Sort: Name</option>
@@ -95,6 +96,24 @@
                         disabled="@(!Playlist.HasItems)">
                     <Icon Name="dice-5-fill" />
                 </button>
+                @if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly && Playback.DislikeCountInPlaylist > 0)
+                {
+                    <button class="btn btn-sm btn-outline-secondary playlist-clear-dislikes-btn"
+                            type="button"
+                            title="Remove all dislikes from this library"
+                            @onclick="ClearAllDislikesAsync">
+                        Clear dislikes
+                    </button>
+                }
+                @if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly && Playback.SuperLikeCountInPlaylist > 0)
+                {
+                    <button class="btn btn-sm btn-outline-secondary playlist-clear-superlikes-btn"
+                            type="button"
+                            title="Remove all super likes from this library"
+                            @onclick="ClearAllSuperLikesAsync">
+                        Clear super likes
+                    </button>
+                }
             </div>
         </div>
     </div>
@@ -116,6 +135,20 @@
                 <div>No favorites in this library.</div>
                 <div class="form-text">Use the heart on a pane while hovering to add favorites.</div>
             }
+            else if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly
+                     && Playback.DislikeCountInPlaylist == 0)
+            {
+                <Icon Name="heartbreak-fill" Size="22" />
+                <div>No dislikes in this library.</div>
+                <div class="form-text">Use the broken heart on a pane while hovering to mark dislikes.</div>
+            }
+            else if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly
+                     && Playback.SuperLikeCountInPlaylist == 0)
+            {
+                <Icon Name="heart-fire-fill" Size="22" />
+                <div>No super likes in this library.</div>
+                <div class="form-text">Use super-like on a pane while hovering to add super likes.</div>
+            }
             else
             {
                 <Icon Name="search" Size="22" />
@@ -133,16 +166,45 @@
                     var isCurrent = Playlist.CurrentItem?.Id == item.Id;
                 }
                 <li class="playlist-item @(isCurrent ? "is-current" : null)">
+                    @if (Dislikes.IsDisliked(item.FilePath) || Favorites.IsFavorite(item.FilePath) || SuperLikes.IsSuperLiked(item.FilePath))
+                    {
+                        <div class="playlist-item-marks">
+                            @if (SuperLikes.IsSuperLiked(item.FilePath))
+                            {
+                                <button class="playlist-item-mark playlist-item-mark-superliked"
+                                        type="button"
+                                        title="Remove super like"
+                                        aria-label="Remove super like"
+                                        @onclick="() => RemoveSuperLikeAsync(item)">
+                                    <Icon Name="heart-fire-fill" Size="12" />
+                                </button>
+                            }
+                            @if (Dislikes.IsDisliked(item.FilePath))
+                            {
+                                <button class="playlist-item-mark playlist-item-mark-disliked"
+                                        type="button"
+                                        title="Remove dislike"
+                                        aria-label="Remove dislike"
+                                        @onclick="() => RemoveDislikeAsync(item)">
+                                    <Icon Name="heartbreak-fill" Size="12" />
+                                </button>
+                            }
+                            @if (Favorites.IsFavorite(item.FilePath))
+                            {
+                                <button class="playlist-item-mark playlist-item-mark-favorite"
+                                        type="button"
+                                        title="Remove from favorites"
+                                        aria-label="Remove from favorites"
+                                        @onclick="() => RemoveFavoriteAsync(item)">
+                                    <Icon Name="heart-fill" Size="12" />
+                                </button>
+                            }
+                        </div>
+                    }
                     <button class="playlist-item-main"
                             type="button"
                             title="@item.FilePath"
                             @onclick="() => Playback.SelectAsync(item)">
-                        @if (Favorites.IsFavorite(item.FilePath))
-                        {
-                            <span class="playlist-item-favorite" title="Favorite" aria-hidden="true">
-                                <Icon Name="heart-fill" Size="12" />
-                            </span>
-                        }
                         <span class="playlist-item-icon">
                             <Icon Name="@IconForKind(item.Kind)" Size="14" />
                         </span>
@@ -190,6 +252,8 @@
     [
         (PlaylistSource.AllLibrary, "All"),
         (PlaylistSource.FavoritesOnly, "Favorites"),
+        (PlaylistSource.DislikesOnly, "Dislikes"),
+        (PlaylistSource.SuperLikesOnly, "Super Favorites"),
     ];
 
     private static readonly IReadOnlyList<(MediaKind Kind, string Label)> KindChips =
@@ -229,6 +293,8 @@
             }
 
             var favoriteCount = Playback.FavoriteCountInPlaylist;
+            var dislikeCount = Playback.DislikeCountInPlaylist;
+            var superLikeCount = Playback.SuperLikeCountInPlaylist;
             var parts = new List<string>();
 
             if (favoriteCount > 0)
@@ -236,9 +302,21 @@
                 parts.Add($"{favoriteCount} favorite{(favoriteCount == 1 ? "" : "s")}");
             }
 
+            if (superLikeCount > 0)
+            {
+                parts.Add($"{superLikeCount} super{(superLikeCount == 1 ? "" : "s")}");
+            }
+
+            if (dislikeCount > 0)
+            {
+                parts.Add($"{dislikeCount} dislike{(dislikeCount == 1 ? "" : "s")}");
+            }
+
             parts.Add($"{total} total");
 
-            if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly
+            if (Playback.Settings.PlaylistSource is PlaylistSource.FavoritesOnly
+                    or PlaylistSource.DislikesOnly
+                    or PlaylistSource.SuperLikesOnly
                 || !Playback.Settings.IsAllMediaKindsEnabled)
             {
                 var shown = _filteredItems.Count;
@@ -262,6 +340,8 @@
         Playlist.Changed += OnStateChanged;
         Playback.Changed += OnStateChanged;
         Favorites.Changed += OnStateChanged;
+        Dislikes.Changed += OnStateChanged;
+        SuperLikes.Changed += OnStateChanged;
         RebuildFilteredItems();
     }
 
@@ -338,6 +418,14 @@
         {
             items = items.Where(item => Favorites.IsFavorite(item.FilePath));
         }
+        else if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly)
+        {
+            items = items.Where(item => Dislikes.IsDisliked(item.FilePath));
+        }
+        else if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly)
+        {
+            items = items.Where(item => SuperLikes.IsSuperLiked(item.FilePath));
+        }
 
         items = items.Where(item => Playback.Settings.IsMediaKindEnabled(item.Kind));
 
@@ -393,6 +481,77 @@
         });
 
         RebuildFilteredItems();
+    }
+
+    private Task RemoveDislikeAsync(MediaItem item)
+    {
+        if (!Dislikes.IsDisliked(item.FilePath))
+        {
+            return Task.CompletedTask;
+        }
+
+        Dislikes.Remove(item.FilePath);
+        Toasts.Info($"Removed dislike: {item.DisplayName}");
+        RebuildFilteredItems();
+        return Task.CompletedTask;
+    }
+
+    private Task RemoveFavoriteAsync(MediaItem item)
+    {
+        if (!Favorites.IsFavorite(item.FilePath))
+        {
+            return Task.CompletedTask;
+        }
+
+        Favorites.Toggle(item.FilePath);
+        Toasts.Info($"Removed from favorites: {item.DisplayName}");
+        RebuildFilteredItems();
+        return Task.CompletedTask;
+    }
+
+    private Task RemoveSuperLikeAsync(MediaItem item)
+    {
+        if (!SuperLikes.IsSuperLiked(item.FilePath))
+        {
+            return Task.CompletedTask;
+        }
+
+        SuperLikes.Remove(item.FilePath);
+        Toasts.Info($"Removed super like: {item.DisplayName}");
+        RebuildFilteredItems();
+        return Task.CompletedTask;
+    }
+
+    private async Task ClearAllDislikesAsync()
+    {
+        var count = Playback.DislikeCountInPlaylist;
+
+        if (count == 0)
+        {
+            return;
+        }
+
+        Dislikes.ClearAll();
+        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = PlaylistSource.AllLibrary);
+        RebuildFilteredItems();
+        Toasts.Info($"Cleared {count} dislike{(count == 1 ? "" : "s")} from this library.");
+        await OnStatusChanged.InvokeAsync($"Cleared {count} dislike{(count == 1 ? "" : "s")}.");
+    }
+
+    private async Task ClearAllSuperLikesAsync()
+    {
+        var count = Playback.SuperLikeCountInPlaylist;
+
+        if (count == 0)
+        {
+            return;
+        }
+
+        SuperLikes.ClearAll();
+        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = PlaylistSource.AllLibrary);
+        RebuildFilteredItems();
+        Toasts.Info($"Cleared {count} super like{(count == 1 ? "" : "s")} from this library.");
+        await OnStatusChanged.InvokeAsync($"Cleared {count} super like{(count == 1 ? "" : "s")}.");
     }
 
     private async Task RevealAsync(MediaItem item)
@@ -458,5 +617,7 @@
         Playlist.Changed -= OnStateChanged;
         Playback.Changed -= OnStateChanged;
         Favorites.Changed -= OnStateChanged;
+        Dislikes.Changed -= OnStateChanged;
+        SuperLikes.Changed -= OnStateChanged;
     }
 }

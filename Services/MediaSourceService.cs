@@ -49,7 +49,20 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
         }
 
         var thumbUri = await LoadThumbnailDataUriAsync(item, cancellationToken);
-        return thumbUri ?? await GetImageDataUriAsync(item, cancellationToken);
+        if (thumbUri is not null)
+        {
+            return thumbUri;
+        }
+
+        // Viewport-sized files must not fall back to reading the full original into the
+        // main cache — that doubles decode work and evicts other panes' thumbnails.
+        if (UsesViewportThumbnailOnly(item))
+        {
+            debugLog.Debug($"Thumbnail generation failed for {item.DisplayName}; viewport will show an error instead of loading the full file.");
+            return string.Empty;
+        }
+
+        return await GetImageDataUriAsync(item, cancellationToken);
     }
 
     public async Task PrefetchThumbnailAsync(MediaItem item, CancellationToken cancellationToken = default)
@@ -275,6 +288,24 @@ public sealed class MediaSourceService(DebugLogService debugLog) : IDisposable
 
         return TryGetCachedThumbnail(itemId, out dataUri);
     }
+
+    /// <summary>
+    /// True when the full display data URI is cached (not just a progressive thumbnail).
+    /// </summary>
+    public bool TryGetCachedFullDisplayUri(Guid itemId, out string dataUri)
+        => TryGetCachedDataUri(itemId, out dataUri);
+
+    public bool TryGetCachedThumbnailUri(Guid itemId, out string dataUri)
+        => TryGetCachedThumbnail(itemId, out dataUri);
+
+    /// <summary>
+    /// Tri-split panes use a 1080px-edge thumbnail for files above ~1.5 MB instead of
+    /// reading multi-megabyte originals into the WebView on every swap.
+    /// </summary>
+    public bool UsesViewportThumbnailOnly(MediaItem item)
+        => item.Kind is (MediaKind.Image or MediaKind.Gif)
+           && item.SizeBytes > ThumbnailGenerationThresholdBytes
+           && item.SizeBytes <= MaxIndividualEntryBytes;
 
     private bool TryGetCachedDataUri(Guid itemId, out string dataUri)
     {

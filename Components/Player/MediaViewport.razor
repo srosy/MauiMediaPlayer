@@ -5,8 +5,11 @@
 @inject DebugLogService DebugLog
 @inject NativeVideoPlaybackService NativeVideo
 @inject FavoritesService Favorites
+@inject DislikesService Dislikes
+@inject SuperLikesService SuperLikes
 @inject ToastService Toasts
 @inject IFullscreenService Fullscreen
+@inject NativePaneSwapDragBridgeService NativePaneSwapBridge
 @inject IJSRuntime JS
 
 @{
@@ -18,7 +21,10 @@
      @ondragover:preventDefault="true"
      @ondragleave="OnDragLeave"
      @ondrop="OnDrop"
-     @ondrop:preventDefault="true">
+     @ondrop:preventDefault="true"
+     @onpointermove="OnViewportPointerMoveAsync"
+     @onpointerup="OnViewportPointerUpAsync"
+     @onpointercancel="OnViewportPointerCancelAsync">
     @if (visiblePanes.Count == 0)
     {
         <div class="empty-state">
@@ -45,9 +51,37 @@
             @* `is-video-pane` toggles a CSS rule that clips holdover/placeholder
                HTML so it never bleeds beneath the caption gradient (where the
                native MediaElement does not paint). See app.css for details. *@
-            <div class="media-pane @(pane.Item.Kind == MediaKind.Video ? "is-video-pane" : null)"
+            <div class="media-pane @(pane.Item.Kind == MediaKind.Video ? "is-video-pane" : null) @(Playback.IsSlotLocked(pane.SlotIndex) ? "is-locked" : null)"
                  data-media-pane
                  data-slot="@pane.SlotIndex">
+                <div class="media-pane-status" aria-hidden="true">
+                    @if (SuperLikes.IsSuperLiked(pane.Item.FilePath))
+                    {
+                        <span class="media-pane-status-icon media-pane-status-superlike" title="Super liked">
+                            <Icon Name="heart-fire-fill" Size="36" />
+                        </span>
+                    }
+                    @if (Favorites.IsFavorite(pane.Item.FilePath))
+                    {
+                        <span class="media-pane-status-icon media-pane-status-favorite" title="Favorite">
+                            <Icon Name="heart-fill" Size="36" />
+                        </span>
+                    }
+                    @if (Dislikes.IsDisliked(pane.Item.FilePath))
+                    {
+                        <span class="media-pane-status-icon media-pane-status-dislike" title="Disliked">
+                            <Icon Name="heartbreak-fill" Size="36" />
+                        </span>
+                    }
+                    @if (Playback.IsSlotLocked(pane.SlotIndex))
+                    {
+                        <span class="media-pane-status-icon media-pane-status-lock" title="Locked">
+                            <Icon Name="lock-fill" Size="36" />
+                        </span>
+                    }
+                </div>
+                <div class="media-pane-zoom-layer"
+                     @onpointerdown="e => OnPanePointerDownAsync(pane.SlotIndex, e)">
                 @if (pane.Item.Kind == MediaKind.Video)
                 {
                     @* Phase 5: extend the Phase 4 hold-over treatment to video panes. The
@@ -138,10 +172,20 @@
                         <p class="mb-0 text-white-50">@pane.Item.DisplayName</p>
                     </div>
                 }
+                </div>
 
                 <div class="media-caption">
                     <span class="media-caption-title">@pane.Item.DisplayName</span>
                     <span class="media-caption-actions">
+                        <button class="media-superlike-btn @(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "is-superliked" : null)"
+                                type="button"
+                                title="@(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "Remove super like" : "Super like")"
+                                aria-label="@(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "Remove super like" : "Super like")"
+                                aria-pressed="@(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "true" : "false")"
+                                @onclick="() => ToggleSuperLikeAsync(pane.Item)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="@(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "heart-fire-fill" : "heart-fire")" Size="18" />
+                        </button>
                         <button class="media-favorite-btn @(Favorites.IsFavorite(pane.Item.FilePath) ? "is-favorited" : null)"
                                 type="button"
                                 title="@(Favorites.IsFavorite(pane.Item.FilePath) ? "Remove from favorites" : "Add to favorites")"
@@ -151,18 +195,59 @@
                                 @onclick:stopPropagation="true">
                             <Icon Name="@(Favorites.IsFavorite(pane.Item.FilePath) ? "heart-fill" : "heart")" Size="18" />
                         </button>
-                        <span class="media-caption-kind">@pane.Item.Kind</span>
+                        <button class="media-dislike-btn @(Dislikes.IsDisliked(pane.Item.FilePath) ? "is-disliked" : null)"
+                                type="button"
+                                title="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "Remove dislike" : "Dislike")"
+                                aria-label="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "Remove dislike" : "Dislike")"
+                                aria-pressed="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "true" : "false")"
+                                @onclick="() => ToggleDislikeAsync(pane.Item)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "heartbreak-fill" : "heartbreak")" Size="18" />
+                        </button>
+                        <button class="media-lock-btn @(Playback.IsSlotLocked(pane.SlotIndex) ? "is-locked" : null)"
+                                type="button"
+                                title="@(Playback.IsSlotLocked(pane.SlotIndex) ? "Unlock pane" : "Lock pane")"
+                                aria-label="@(Playback.IsSlotLocked(pane.SlotIndex) ? "Unlock pane" : "Lock pane")"
+                                aria-pressed="@(Playback.IsSlotLocked(pane.SlotIndex) ? "true" : "false")"
+                                @onclick="() => ToggleLockAsync(pane.SlotIndex)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="@(Playback.IsSlotLocked(pane.SlotIndex) ? "lock-fill" : "unlock")" Size="12" />
+                        </button>
+                        <button class="media-back-btn"
+                                type="button"
+                                disabled="@(!Playback.CanGoBackSlot(pane.SlotIndex))"
+                                title="@GetBackButtonTitle(pane.SlotIndex)"
+                                aria-label="@GetBackButtonAriaLabel(pane.SlotIndex)"
+                                @onclick="() => GoBackSlotAsync(pane.SlotIndex)"
+                                @onclick:stopPropagation="true">
+                            <Icon Name="skip-start-fill" Size="12" />
+                        </button>
                         <button class="media-skip-btn"
                                 type="button"
+                                disabled="@(Playback.IsSlotLocked(pane.SlotIndex))"
                                 title="Skip this pane to the next item"
                                 aria-label="Skip pane"
                                 @onclick="() => SkipSlotAsync(pane.SlotIndex)"
                                 @onclick:stopPropagation="true">
                             <Icon Name="skip-forward-fill" Size="12" />
                         </button>
+                        <span class="media-caption-kind">@pane.Item.Kind</span>
                     </span>
                 </div>
             </div>
+        }
+
+        @if (Playback.Status == PlaybackStatus.Paused)
+        {
+            <button class="media-pause-overlay"
+                    type="button"
+                    title="Resume playback"
+                    aria-label="Resume playback"
+                    @onclick="OnPauseOverlayClickAsync">
+                <span class="media-pause-overlay-icon @( _pauseOverlayShowPauseIcon ? "is-pause-flash" : null)">
+                    <Icon Name="@(_pauseOverlayShowPauseIcon ? "pause-fill" : "play-fill")" Size="72" />
+                </span>
+            </button>
         }
     }
 </div>
@@ -172,6 +257,8 @@
     [Parameter] public EventCallback<string[]> OnDroppedPaths { get; set; }
 
     private const int MaxPanes = 3;
+    private const double PaneDragThresholdPx = 8;
+    private const double PaneDragGhostOffsetPx = 18;
     private readonly Dictionary<Guid, string> _imageSources = [];
     private readonly Dictionary<Guid, string> _imageErrors = [];
     private readonly HashSet<Guid> _loadingImageIds = [];
@@ -199,27 +286,481 @@
     // Pane assignment key — bounds are re-synced when this changes, not on every
     // image decode (which was re-positioning native video overlays unnecessarily).
     private string? _lastBoundsSyncKey;
+    private bool _pauseOverlayShowPauseIcon;
+    private CancellationTokenSource? _pauseOverlayCts;
+    private bool _paneDragUsesJsSession;
+    private bool _paneDragDeferredRefresh;
 
     private IReadOnlyList<VisibleMediaSlot> VisiblePanes => Playback.VisiblePanes;
+
+    private bool _nativePaneDragActive;
+    private int _nativePaneDragSlot = -1;
+
+    private bool CanPaneDragSwap => Playback.Settings.SplitScreenCount >= 2 && VisiblePanes.Count >= 2;
 
     protected override void OnInitialized()
     {
         Playback.Changed += OnPlaybackChanged;
         Playlist.Changed += OnPlaybackChanged;
         Favorites.Changed += OnFavoritesChanged;
+        Dislikes.Changed += OnDislikesChanged;
+        SuperLikes.Changed += OnSuperLikesChanged;
         Fullscreen.FullscreenChanged += OnFullscreenChanged;
+
+        NativePaneSwapBridge.Register(
+            () => CanPaneDragSwap,
+            StartNativePaneSwapDragAsync,
+            UpdateNativePaneSwapDragAsync,
+            CompleteNativePaneSwapDragAsync);
+    }
+
+    private async Task ToggleSuperLikeAsync(MediaItem item)
+    {
+        if (Dislikes.IsDisliked(item.FilePath))
+        {
+            Dislikes.Remove(item.FilePath);
+        }
+
+        var added = SuperLikes.Toggle(item.FilePath);
+        Toasts.Info(added ? $"Super liked: {item.DisplayName}" : $"Removed super like: {item.DisplayName}");
+        await InvokeAsync(StateHasChanged);
     }
 
     private async Task ToggleFavoriteAsync(MediaItem item)
     {
+        if (Dislikes.IsDisliked(item.FilePath))
+        {
+            Dislikes.Remove(item.FilePath);
+        }
+
         var added = Favorites.Toggle(item.FilePath);
         Toasts.Info(added ? $"Added to favorites: {item.DisplayName}" : $"Removed from favorites: {item.DisplayName}");
         await InvokeAsync(StateHasChanged);
     }
 
+    private async Task ToggleDislikeAsync(MediaItem item)
+    {
+        if (Favorites.IsFavorite(item.FilePath))
+        {
+            Favorites.Toggle(item.FilePath);
+        }
+
+        if (SuperLikes.IsSuperLiked(item.FilePath))
+        {
+            SuperLikes.Remove(item.FilePath);
+        }
+
+        var added = Dislikes.Toggle(item.FilePath);
+        Toasts.Info(added ? $"Disliked: {item.DisplayName}" : $"Removed dislike: {item.DisplayName}");
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task OnPauseOverlayClickAsync()
+    {
+        _pauseOverlayCts?.Cancel();
+        _pauseOverlayCts = new CancellationTokenSource();
+        var token = _pauseOverlayCts.Token;
+
+        _pauseOverlayShowPauseIcon = true;
+        await InvokeAsync(StateHasChanged);
+
+        try
+        {
+            await Task.Delay(400, token);
+        }
+        catch (TaskCanceledException)
+        {
+            return;
+        }
+
+        if (Playback.Status == PlaybackStatus.Paused)
+        {
+            await Playback.PlayAsync();
+        }
+
+        _pauseOverlayShowPauseIcon = false;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private void ToggleLockAsync(int slotIndex)
+    {
+        Playback.ToggleSlotLock(slotIndex);
+    }
+
+    private async Task GoBackSlotAsync(int slotIndex)
+    {
+        try
+        {
+            await Playback.GoBackSlotAsync(slotIndex);
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Error($"Back failed for slot {slotIndex + 1}: {exception.Message}");
+        }
+    }
+
+    private string GetBackButtonTitle(int slotIndex) =>
+        Playback.CanUndoDislikeOnSlot(slotIndex)
+            ? "Remove dislike"
+            : "Go back to previous item";
+
+    private string GetBackButtonAriaLabel(int slotIndex) =>
+        Playback.CanUndoDislikeOnSlot(slotIndex)
+            ? "Remove dislike"
+            : "Go back";
+
     private void OnFavoritesChanged()
     {
+        if (_paneDragUsesJsSession)
+        {
+            return;
+        }
+
         _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void OnDislikesChanged()
+    {
+        if (_paneDragUsesJsSession)
+        {
+            return;
+        }
+
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void OnSuperLikesChanged()
+    {
+        if (_paneDragUsesJsSession)
+        {
+            return;
+        }
+
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void LogPaneSwap(string level, string message)
+    {
+        switch (level.ToUpperInvariant())
+        {
+            case "TRACE":
+                DebugLog.Trace($"PaneSwap: {message}");
+                break;
+            case "DEBUG":
+                DebugLog.Debug($"PaneSwap: {message}");
+                break;
+            case "ERROR":
+                DebugLog.Error($"PaneSwap: {message}");
+                break;
+            default:
+                DebugLog.Info($"PaneSwap: {message}");
+                break;
+        }
+    }
+
+    private async Task OnPanePointerDownAsync(int slotIndex, PointerEventArgs args)
+    {
+        if (!CanPaneDragSwap || args.Button != 0)
+        {
+            if (args.Button == 0)
+            {
+                LogPaneSwap(
+                    "DEBUG",
+                    $"pointerdown ignored on slot {slotIndex + 1}: CanPaneDragSwap=false (split={Playback.Settings.SplitScreenCount}; visiblePanes={VisiblePanes.Count}).");
+            }
+
+            return;
+        }
+
+        if (_paneDragUsesJsSession)
+        {
+            LogPaneSwap("DEBUG", "pointerdown ignored — drag session already active.");
+            return;
+        }
+
+        _paneDragUsesJsSession = true;
+
+        LogPaneSwap(
+            "DEBUG",
+            $"pointerdown slot {slotIndex + 1}; pointerId={args.PointerId}; at=({args.ClientX:0},{args.ClientY:0}); status={Playback.Status}.");
+
+        _dotNetReference ??= DotNetObjectReference.Create(this);
+
+        try
+        {
+            await JS.InvokeVoidAsync(
+                "mauiMediaPlayer.startPaneSwapDrag",
+                _dotNetReference,
+                (int)args.PointerId,
+                slotIndex,
+                args.ClientX,
+                args.ClientY,
+                PaneDragThresholdPx,
+                PaneDragGhostOffsetPx);
+        }
+        catch (JSDisconnectedException)
+        {
+            LogPaneSwap("ERROR", "startPaneSwapDrag failed — JS disconnected.");
+            _paneDragUsesJsSession = false;
+        }
+
+        // Intentionally no StateHasChanged — drag visuals are JS-only until release.
+    }
+
+    private async Task StartNativePaneSwapDragAsync(int slotIndex, double clientX, double clientY)
+    {
+        if (!CanPaneDragSwap)
+        {
+            LogPaneSwap(
+                "DEBUG",
+                $"native pan ignored on slot {slotIndex + 1}: CanPaneDragSwap=false (split={Playback.Settings.SplitScreenCount}; visiblePanes={VisiblePanes.Count}).");
+            return;
+        }
+
+        if (_paneDragUsesJsSession)
+        {
+            LogPaneSwap("DEBUG", "native pan ignored — drag session already active.");
+            return;
+        }
+
+        _paneDragUsesJsSession = true;
+        _nativePaneDragActive = true;
+        _nativePaneDragSlot = slotIndex;
+
+        LogPaneSwap(
+            "DEBUG",
+            $"native pan begin slot {slotIndex + 1}; at=({clientX:0},{clientY:0}); status={Playback.Status}.");
+
+        _dotNetReference ??= DotNetObjectReference.Create(this);
+
+        await NativeVideo.SetPaneSwapSuppressedAsync(slotIndex, suppress: true);
+
+        try
+        {
+            await JS.InvokeVoidAsync(
+                "mauiMediaPlayer.startPaneSwapDragFromNative",
+                _dotNetReference,
+                slotIndex,
+                clientX,
+                clientY,
+                PaneDragThresholdPx,
+                PaneDragGhostOffsetPx);
+        }
+        catch (JSDisconnectedException)
+        {
+            LogPaneSwap("ERROR", "startPaneSwapDragFromNative failed — JS disconnected.");
+            await ClearNativePaneDragStateAsync();
+        }
+    }
+
+    private async Task UpdateNativePaneSwapDragAsync(int slotIndex, double clientX, double clientY)
+    {
+        if (!_nativePaneDragActive || slotIndex != _nativePaneDragSlot)
+        {
+            return;
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.updatePaneSwapDragFromNative", clientX, clientY);
+        }
+        catch (JSDisconnectedException)
+        {
+            LogPaneSwap("ERROR", "updatePaneSwapDragFromNative failed — JS disconnected.");
+        }
+    }
+
+    private async Task CompleteNativePaneSwapDragAsync(int slotIndex, double clientX, double clientY, bool canceled)
+    {
+        if (!_nativePaneDragActive || slotIndex != _nativePaneDragSlot)
+        {
+            return;
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync(
+                "mauiMediaPlayer.finishPaneSwapDragFromNative",
+                clientX,
+                clientY,
+                canceled ? "native-cancel" : "native-up");
+        }
+        catch (JSDisconnectedException)
+        {
+            LogPaneSwap("ERROR", "finishPaneSwapDragFromNative failed — JS disconnected.");
+            await ClearNativePaneDragStateAsync();
+        }
+    }
+
+    [JSInvokable]
+    public async Task OnPaneSwapDragArmed(int sourceSlot)
+    {
+        LogPaneSwap("DEBUG", $"armed callback for slot {sourceSlot + 1}; suppressing native video overlays for hit-testing.");
+
+        NativePaneSwapBridge.NotifyNativeDragArmed();
+
+        foreach (var pane in VisiblePanes.Where(p => p.Item.Kind == MediaKind.Video))
+        {
+            await NativeVideo.SetPaneSwapSuppressedAsync(pane.SlotIndex, suppress: true);
+        }
+    }
+
+    private async Task ClearNativePaneDragStateAsync()
+    {
+        _nativePaneDragActive = false;
+        _nativePaneDragSlot = -1;
+        _paneDragUsesJsSession = false;
+        await NativeVideo.ClearPaneSwapSuppressionAsync();
+    }
+
+    [JSInvokable]
+    public async Task OnPaneSwapDragComplete(int sourceSlot, int targetSlot, bool armed, string reason)
+    {
+        var deferredRefresh = _paneDragDeferredRefresh;
+        _paneDragUsesJsSession = false;
+        _paneDragDeferredRefresh = false;
+        _nativePaneDragActive = false;
+        _nativePaneDragSlot = -1;
+
+        await NativeVideo.ClearPaneSwapSuppressionAsync();
+
+        LogPaneSwap(
+            "DEBUG",
+            $"complete ({reason}); armed={armed}; source slot {sourceSlot + 1}; target={(targetSlot >= 0 ? $"slot {targetSlot + 1}" : "none")}.");
+
+        var swapped = armed && targetSlot >= 0 && targetSlot != sourceSlot;
+
+        if (swapped)
+        {
+            LogPaneSwap("DEBUG", $"committing swap slot {sourceSlot + 1} ↔ slot {targetSlot + 1}.");
+            SwapViewportSlotState(sourceSlot, targetSlot);
+            await Playback.SwapSlotsAsync(sourceSlot, targetSlot);
+            await InvalidatePaneZoomAsync();
+            NativeVideo.RequestLayoutBoundsResync();
+
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.invalidateMediaPaneBoundsCache");
+                await JS.InvokeVoidAsync("mauiMediaPlayer.requestMediaPaneBoundsFlush");
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+
+            await UpdateNativeVideoBoundsAsync();
+        }
+        else if (armed)
+        {
+            LogPaneSwap("DEBUG", "released without swap — no valid drop target.");
+        }
+        else
+        {
+            LogPaneSwap("DEBUG", "released before drag threshold — treated as click.");
+        }
+
+        // SwapSlotsAsync fires NotifyChanged which refreshes the viewport. Only run an
+        // explicit refresh when the drag ended without a swap but slots advanced underneath.
+        if (!swapped && deferredRefresh)
+        {
+            await RefreshAfterPlaybackChangedAsync();
+        }
+        else if (!swapped)
+        {
+            await InvalidatePaneZoomAsync();
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private Task OnViewportPointerMoveAsync(PointerEventArgs args)
+    {
+        if (_paneDragUsesJsSession)
+        {
+            return Task.CompletedTask;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task OnViewportPointerUpAsync(PointerEventArgs args)
+    {
+        if (_paneDragUsesJsSession)
+        {
+            LogPaneSwap("TRACE", $"viewport pointerup ignored (JS session); pointerId={args.PointerId}.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task OnViewportPointerCancelAsync(PointerEventArgs args)
+    {
+        if (_paneDragUsesJsSession)
+        {
+            LogPaneSwap("TRACE", $"viewport pointercancel ignored (JS session); pointerId={args.PointerId}.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private async Task ClearPaneDragStateAsync()
+    {
+        if (!_paneDragUsesJsSession)
+        {
+            return;
+        }
+
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.stopPaneSwapDrag", _dotNetReference, "clear");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+
+        _paneDragUsesJsSession = false;
+    }
+
+    private void SwapViewportSlotState(int slotA, int slotB)
+    {
+        SwapDictionaryEntry(_lastShownImagePerSlot, slotA, slotB);
+        SwapDictionaryEntry(_previousKindPerSlot, slotA, slotB);
+        SwapDictionaryEntry(_lastObservedItemIdPerSlot, slotA, slotB);
+        SwapDictionaryEntry(_lastObservedKindPerSlot, slotA, slotB);
+    }
+
+    private static void SwapDictionaryEntry(Dictionary<int, string> dict, int slotA, int slotB) =>
+        SwapDictionaryEntries(dict, slotA, slotB);
+
+    private static void SwapDictionaryEntry(Dictionary<int, MediaKind> dict, int slotA, int slotB) =>
+        SwapDictionaryEntries(dict, slotA, slotB);
+
+    private static void SwapDictionaryEntry(Dictionary<int, Guid> dict, int slotA, int slotB) =>
+        SwapDictionaryEntries(dict, slotA, slotB);
+
+    private static void SwapDictionaryEntries<T>(Dictionary<int, T> dict, int slotA, int slotB)
+    {
+        var hasA = dict.ContainsKey(slotA);
+        var hasB = dict.ContainsKey(slotB);
+
+        if (!hasA && !hasB)
+        {
+            return;
+        }
+
+        if (!hasA)
+        {
+            dict[slotA] = dict[slotB];
+            dict.Remove(slotB);
+            return;
+        }
+
+        if (!hasB)
+        {
+            dict[slotB] = dict[slotA];
+            dict.Remove(slotA);
+            return;
+        }
+
+        (dict[slotA], dict[slotB]) = (dict[slotB], dict[slotA]);
     }
 
     private Task RequestAddMedia() => OnRequestAddMedia.InvokeAsync();
@@ -293,6 +834,13 @@
         {
             _dotNetReference ??= DotNetObjectReference.Create(this);
             await JS.InvokeVoidAsync("mauiMediaPlayer.observeMediaViewportBounds", _dotNetReference);
+            try
+            {
+                await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneZoom");
+            }
+            catch (JSDisconnectedException)
+            {
+            }
         }
 
         var boundsSyncKey = BuildBoundsSyncKey(VisiblePanes);
@@ -304,6 +852,7 @@
             try
             {
                 await JS.InvokeVoidAsync("mauiMediaPlayer.ensureMediaPaneObservers");
+                await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneZoom");
             }
             catch (JSDisconnectedException)
             {
@@ -439,6 +988,19 @@
 
     private void OnPlaybackChanged()
     {
+        if (Playback.Status != PlaybackStatus.Paused)
+        {
+            _pauseOverlayCts?.Cancel();
+            _pauseOverlayShowPauseIcon = false;
+        }
+
+        if (_paneDragUsesJsSession)
+        {
+            _paneDragDeferredRefresh = true;
+            LogPaneSwap("TRACE", "playback changed during drag — refresh deferred until release.");
+            return;
+        }
+
         _ = RefreshAfterPlaybackChangedAsync();
     }
 
@@ -454,8 +1016,22 @@
         }
     }
 
+    private async Task InvalidatePaneZoomAsync()
+    {
+        try
+        {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.invalidatePaneZoom");
+            await JS.InvokeVoidAsync("mauiMediaPlayer.requestMediaPaneBoundsFlush");
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+    }
+
     private async Task RefreshAfterPlaybackChangedAsync()
     {
+        await InvalidatePaneZoomAsync();
+
         try
         {
             await InvokeAsync(() =>
@@ -543,7 +1119,8 @@
                 continue;
             }
 
-            if (!MediaSource.TryGetCachedDisplayUri(item.Id, out var cachedUri))
+            if (!MediaSource.TryGetCachedFullDisplayUri(item.Id, out var cachedUri)
+                && !MediaSource.TryGetCachedDisplayUri(item.Id, out cachedUri))
             {
                 continue;
             }
@@ -580,25 +1157,29 @@
     {
         try
         {
-            var thumbnail = await MediaSource.GetThumbnailDataUriAsync(item);
-
-            if (IsVisibleItem(item.Id))
+            if (!MediaSource.UsesViewportThumbnailOnly(item)
+                && MediaSource.TryGetCachedFullDisplayUri(item.Id, out var alreadyCached))
             {
-                foreach (var pane in VisiblePanes.Where(p => p.Item.Id == item.Id))
+                if (IsVisibleItem(item.Id))
                 {
-                    _lastShownImagePerSlot[pane.SlotIndex] = thumbnail;
+                    await AttachImageSourceAsync(item, alreadyCached);
                 }
 
-                if (!_imageSources.ContainsKey(item.Id))
-                {
-                    await InvokeAsync(StateHasChanged);
-                }
+                return;
             }
 
-            var wasCached = MediaSource.TryGetCachedDisplayUri(item.Id, out var cachedUri);
-            var imageSource = wasCached
-                ? cachedUri
-                : await MediaSource.GetImageDataUriAsync(item);
+            if (MediaSource.UsesViewportThumbnailOnly(item)
+                && MediaSource.TryGetCachedThumbnailUri(item.Id, out var cachedViewportThumb))
+            {
+                if (IsVisibleItem(item.Id))
+                {
+                    await AttachImageSourceAsync(item, cachedViewportThumb);
+                }
+
+                return;
+            }
+
+            var thumbnail = await MediaSource.GetThumbnailDataUriAsync(item);
 
             if (!IsVisibleItem(item.Id))
             {
@@ -606,15 +1187,53 @@
                 return;
             }
 
-            if (!wasCached)
+            // Files under the thumbnail threshold load the full image in GetThumbnailDataUriAsync.
+            // Attach once — do not paint a holdover <img> and then swap to a second <img> with
+            // the same data URI (that decoded the image twice in the WebView).
+            if (!MediaSource.UsesViewportThumbnailOnly(item)
+                && MediaSource.TryGetCachedFullDisplayUri(item.Id, out var fullFromThumbnailPath))
             {
-                await PrewarmInWebViewAsync(imageSource, item.DisplayName);
+                await AttachImageSourceAsync(item, fullFromThumbnailPath);
+                return;
+            }
 
+            if (MediaSource.UsesViewportThumbnailOnly(item))
+            {
                 if (!IsVisibleItem(item.Id))
                 {
-                    DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; pane changed during prewarm.");
+                    DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; current panes changed before display.");
                     return;
                 }
+
+                if (MediaSource.TryGetCachedThumbnailUri(item.Id, out var viewportThumbnail))
+                {
+                    await AttachImageSourceAsync(item, viewportThumbnail);
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(thumbnail))
+                {
+                    throw new InvalidOperationException($"Could not generate a viewport thumbnail for {item.DisplayName}.");
+                }
+
+                await AttachImageSourceAsync(item, thumbnail);
+                return;
+            }
+
+            var imageSource = await MediaSource.GetImageDataUriAsync(item);
+
+            if (!IsVisibleItem(item.Id))
+            {
+                DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; current panes changed before display.");
+                return;
+            }
+
+            await PrewarmInWebViewAsync(imageSource, item.DisplayName);
+
+            if (!IsVisibleItem(item.Id))
+            {
+                DebugLog.Trace($"Discarding stale image source for {item.DisplayName}; pane changed during prewarm.");
+                return;
             }
 
             await AttachImageSourceAsync(item, imageSource);
@@ -760,15 +1379,28 @@
         Playback.Changed -= OnPlaybackChanged;
         Playlist.Changed -= OnPlaybackChanged;
         Favorites.Changed -= OnFavoritesChanged;
+        Dislikes.Changed -= OnDislikesChanged;
+        SuperLikes.Changed -= OnSuperLikesChanged;
+        _pauseOverlayCts?.Cancel();
+        _pauseOverlayCts?.Dispose();
         Fullscreen.FullscreenChanged -= OnFullscreenChanged;
+        NativePaneSwapBridge.Unregister();
 
         try
         {
+            await JS.InvokeVoidAsync("mauiMediaPlayer.stopPaneSwapDrag", _dotNetReference, "dispose");
             await JS.InvokeVoidAsync("mauiMediaPlayer.disposeMediaViewportBoundsObserver");
         }
         catch (JSDisconnectedException)
         {
         }
+
+        _paneDragUsesJsSession = false;
+        _paneDragDeferredRefresh = false;
+        _nativePaneDragActive = false;
+        _nativePaneDragSlot = -1;
+
+        await NativeVideo.ClearPaneSwapSuppressionAsync();
 
         _dotNetReference?.Dispose();
     }

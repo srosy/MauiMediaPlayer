@@ -6,6 +6,8 @@ public sealed class PlaybackService(
     PlaylistService playlistService,
     SettingsService settingsService,
     FavoritesService favoritesService,
+    DislikesService dislikesService,
+    SuperLikesService superLikesService,
     DebugLogService debugLog,
     NativeVideoPlaybackService nativeVideoPlayback,
     MediaSourceService mediaSourceService,
@@ -33,6 +35,11 @@ public sealed class PlaybackService(
     // separates "first fill" from "natural exhaustion" so LoopMode.Off can stop cleanly.
     private readonly Queue<int>?[] _slotShuffleQueues = new Queue<int>?[MaxSlots];
     private readonly bool[] _slotShuffleQueueInitialized = new bool[MaxSlots];
+    private readonly bool[] _slotStaggerApplied = new bool[MaxSlots];
+    private readonly bool[] _slotLocked = new bool[MaxSlots];
+    private readonly LinkedList<int>[] _slotHistory = Enumerable.Range(0, MaxSlots)
+        .Select(_ => new LinkedList<int>()).ToArray();
+    private const int MaxSlotHistoryDepth = 10;
     // Guards the relationship between _slotBasePlaylistIndex, _slotIndices, and
     // playlistService.CurrentIndex so EnsureSlotIndices never observes a transient
     // inconsistent state while CompleteSlotAsync (background thread) is aligning slot 0
@@ -45,11 +52,17 @@ public sealed class PlaybackService(
     private Guid? _lastPlayedItemId;
     private bool _videoTakeoverHintShown;
     private bool _favoritesEmptyNotified;
+    private bool _dislikesEmptyNotified;
+    private bool _superlikesEmptyNotified;
     private bool _mediaKindsEmptyNotified;
 
     public event Action? Changed;
 
     public int FavoriteCountInPlaylist => favoritesService.CountInPlaylist(playlistService.Items.Select(static item => item.FilePath));
+
+    public int DislikeCountInPlaylist => dislikesService.CountInPlaylist(playlistService.Items.Select(static item => item.FilePath));
+
+    public int SuperLikeCountInPlaylist => superLikesService.CountInPlaylist(playlistService.Items.Select(static item => item.FilePath));
 
     public PlaybackSettings Settings { get; private set; } = new();
 
@@ -82,6 +95,8 @@ public sealed class PlaybackService(
         // hold bytes for items that left the playlist. Cheap O(cache-size) sweep.
         playlistService.Changed += PruneImageCacheToPlaylist;
         favoritesService.Changed += OnFavoritesChanged;
+        dislikesService.Changed += OnDislikesChanged;
+        superLikesService.Changed += OnSuperLikesChanged;
         SyncPlaylistShuffleCallbacks();
         LogActiveConfiguration("settings-loaded");
         NotifyChanged();
@@ -107,9 +122,23 @@ public sealed class PlaybackService(
         if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
         {
             NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyDislikesOnlyEmptyIfNeeded();
+            NotifySuperLikesOnlyEmptyIfNeeded();
             NotifyMediaKindsFilterEmptyIfNeeded();
             await StopAsync();
             return;
+        }
+
+        if (Settings.Shuffle && Status == PlaybackStatus.Stopped && playlistService.HasItems)
+        {
+            var eligible = GetEligiblePlaylistIndices(MediaKindRequirement.Any);
+
+            if (eligible.Count > 1)
+            {
+                var randomStart = eligible[Random.Shared.Next(eligible.Count)];
+                playlistService.SetCurrentIndex(randomStart);
+                debugLog.Debug($"Shuffle start: randomized to index {randomStart}.");
+            }
         }
 
         EnsureSlotIndices();
@@ -160,6 +189,8 @@ public sealed class PlaybackService(
             Array.Fill(_slotNativeGenerations, null);
             Array.Fill(_slotLastUnsatisfiableTraceIndex, -1);
             ResetSlotShuffleBagsLocked();
+            ClearSlotLockAndHistoryLocked();
+            Array.Fill(_slotStaggerApplied, false);
             _slotIndicesInitialized = false;
             _slotBasePlaylistIndex = -1;
         }
@@ -182,6 +213,8 @@ public sealed class PlaybackService(
         }
 
         NotifyFavoritesOnlyEmptyIfNeeded();
+        NotifyDislikesOnlyEmptyIfNeeded();
+        NotifySuperLikesOnlyEmptyIfNeeded();
         NotifyMediaKindsFilterEmptyIfNeeded();
         await StopAsync();
     }
@@ -199,6 +232,8 @@ public sealed class PlaybackService(
         }
 
         NotifyFavoritesOnlyEmptyIfNeeded();
+        NotifyDislikesOnlyEmptyIfNeeded();
+        NotifySuperLikesOnlyEmptyIfNeeded();
         NotifyMediaKindsFilterEmptyIfNeeded();
     }
 
@@ -212,6 +247,8 @@ public sealed class PlaybackService(
         if (eligible.Count == 0)
         {
             NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyDislikesOnlyEmptyIfNeeded();
+            NotifySuperLikesOnlyEmptyIfNeeded();
             NotifyMediaKindsFilterEmptyIfNeeded();
             return;
         }
@@ -266,8 +303,191 @@ public sealed class PlaybackService(
             return Task.CompletedTask;
         }
 
+        if (_slotLocked[slotIndex])
+        {
+            debugLog.Debug($"Skip blocked for slot {slotIndex + 1}; slot is locked.");
+            return Task.CompletedTask;
+        }
+
         debugLog.Debug($"Skip requested for slot {slotIndex + 1}.");
         return CompleteSlotAsync(slotIndex, expectedPath: null, playbackGeneration: null, forceAdvance: true);
+    }
+
+    public bool IsSlotLocked(int slotIndex)
+        => slotIndex >= 0 && slotIndex < MaxSlots && _slotLocked[slotIndex];
+
+    public void ToggleSlotLock(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots || !IsActiveSlot(slotIndex))
+        {
+            return;
+        }
+
+        _slotLocked[slotIndex] = !_slotLocked[slotIndex];
+        debugLog.Info($"Slot {slotIndex + 1} {(_slotLocked[slotIndex] ? "locked" : "unlocked")}; item={GetSlotItem(slotIndex)?.DisplayName}.");
+        NotifyChanged();
+    }
+
+    public async Task SwapSlotsAsync(int slotA, int slotB)
+    {
+        if (Settings.SplitScreenCount < 2)
+        {
+            debugLog.Debug($"PaneSwap: SwapSlotsAsync rejected — SplitScreenCount={Settings.SplitScreenCount}.");
+            return;
+        }
+
+        if (slotA == slotB)
+        {
+            debugLog.Debug($"PaneSwap: SwapSlotsAsync rejected — same slot ({slotA + 1}).");
+            return;
+        }
+
+        if (!IsActiveSlot(slotA) || !IsActiveSlot(slotB))
+        {
+            debugLog.Debug($"PaneSwap: SwapSlotsAsync rejected — inactive slot(s); a={slotA + 1} active={IsActiveSlot(slotA)}; b={slotB + 1} active={IsActiveSlot(slotB)}.");
+            return;
+        }
+
+        if (Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
+        {
+            debugLog.Debug($"PaneSwap: SwapSlotsAsync rejected — status={Status} (need Playing or Paused).");
+            return;
+        }
+
+        debugLog.Debug($"PaneSwap: SwapSlotsAsync executing slot {slotA + 1} ↔ slot {slotB + 1}.");
+
+        // Preserve paused state across the swap. PlaySingleSlotAsync below routes through
+        // NativeVideoPlaybackService.PlaySlotAsync which auto-plays new video sources, so
+        // without this guard a swap during pause would silently resume playback.
+        var wasPaused = Status == PlaybackStatus.Paused;
+
+        StopSlotTimer(slotA);
+        StopSlotTimer(slotB);
+
+        lock (_slotStateLock)
+        {
+            (_slotIndices[slotA], _slotIndices[slotB]) = (_slotIndices[slotB], _slotIndices[slotA]);
+            (_slotLocked[slotA], _slotLocked[slotB]) = (_slotLocked[slotB], _slotLocked[slotA]);
+            (_slotNativeGenerations[slotA], _slotNativeGenerations[slotB]) = (
+                _slotNativeGenerations[slotB], _slotNativeGenerations[slotA]);
+            (_slotHistory[slotA], _slotHistory[slotB]) = (_slotHistory[slotB], _slotHistory[slotA]);
+            (_slotLastUnsatisfiableTraceIndex[slotA], _slotLastUnsatisfiableTraceIndex[slotB]) = (
+                _slotLastUnsatisfiableTraceIndex[slotB], _slotLastUnsatisfiableTraceIndex[slotA]);
+            (_slotStaggerApplied[slotA], _slotStaggerApplied[slotB]) = (
+                _slotStaggerApplied[slotB], _slotStaggerApplied[slotA]);
+        }
+
+        // Do not run AlignSlotsToEligibilityLocked or ApplySlotConstraintsLocked here.
+        // A drag-swap is an explicit layout choice; post-swap realignment undid swaps and
+        // surfaced a misleading "keep video in center" toast even when only images were showing.
+
+        InvalidateShuffleState();
+
+        if (slotA == 0 || slotB == 0)
+        {
+            var primaryItem = GetSlotItem(0);
+
+            if (primaryItem is not null)
+            {
+                lock (_slotStateLock)
+                {
+                    _slotBasePlaylistIndex = _slotIndices[0];
+                    playlistService.SetCurrent(primaryItem);
+                }
+
+                _lastPlayedItemId = primaryItem.Id;
+                VideoPosition = TimeSpan.Zero;
+                VideoDuration = TimeSpan.Zero;
+            }
+        }
+
+        await PlaySingleSlotAsync(slotA, forceRestartTimer: true, restartVideoIfSameSource: true);
+        await PlaySingleSlotAsync(slotB, forceRestartTimer: true, restartVideoIfSameSource: true);
+
+        if (wasPaused)
+        {
+            StopAllSlotTimers();
+            await nativeVideoPlayback.PauseAsync();
+        }
+
+        NotifyChanged();
+    }
+
+    public bool CanUndoDislikeOnSlot(int slotIndex) =>
+        Settings.BackButtonRemovesDislike
+        && slotIndex >= 0
+        && slotIndex < MaxSlots
+        && !_slotLocked[slotIndex]
+        && GetSlotItem(slotIndex) is { } item
+        && dislikesService.IsDisliked(item.FilePath);
+
+    public bool CanGoBackSlot(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots || _slotLocked[slotIndex])
+        {
+            return false;
+        }
+
+        if (CanUndoDislikeOnSlot(slotIndex))
+        {
+            return true;
+        }
+
+        lock (_slotStateLock)
+        {
+            return _slotHistory[slotIndex].Count > 0;
+        }
+    }
+
+    public async Task GoBackSlotAsync(int slotIndex)
+    {
+        if (!CanGoBackSlot(slotIndex) || Status != PlaybackStatus.Playing)
+        {
+            return;
+        }
+
+        if (CanUndoDislikeOnSlot(slotIndex))
+        {
+            var item = GetSlotItem(slotIndex)!;
+            dislikesService.Remove(item.FilePath);
+            toasts.Info($"Removed dislike: {item.DisplayName}");
+            OnDislikesChanged();
+            return;
+        }
+
+        int targetIndex;
+
+        lock (_slotStateLock)
+        {
+            var history = _slotHistory[slotIndex];
+
+            while (history.Count > 0)
+            {
+                var candidate = history.Last!.Value;
+                history.RemoveLast();
+
+                if (candidate >= 0 && candidate < playlistService.Items.Count)
+                {
+                    targetIndex = candidate;
+                    goto found;
+                }
+            }
+
+            return;
+        }
+
+        found:
+
+        debugLog.Info($"Slot {slotIndex + 1} going back to index={targetIndex}; item={playlistService.Items[targetIndex].DisplayName}.");
+
+        lock (_slotStateLock)
+        {
+            _slotIndices[slotIndex] = targetIndex;
+            _slotNativeGenerations[slotIndex] = null;
+        }
+
+        await PlaySingleSlotAsync(slotIndex, forceRestartTimer: true, restartVideoIfSameSource: true);
+        NotifyChanged();
     }
 
     public async Task UpdateSettingsAsync(Action<PlaybackSettings> update)
@@ -288,6 +508,11 @@ public sealed class PlaybackService(
         var previousEnabledMediaKinds = Settings.EnabledMediaKinds;
         var previousBoostFavorites = Settings.BoostFavoritesInShuffle;
         var previousFavoriteWeight = Settings.FavoriteShuffleWeight;
+        var previousPenalizeDislikes = Settings.PenalizeDislikesInShuffle;
+        var previousDislikeWeight = Settings.DislikeShuffleWeight;
+        var previousBoostSuperLikes = Settings.BoostSuperLikesInShuffle;
+        var previousSuperLikeWeight = Settings.SuperLikeShuffleWeight;
+        var previousStagger = Settings.StaggerPaneTransitions;
         update(Settings);
         Settings.EnabledMediaKinds = PlaybackSettings.NormalizeEnabledMediaKinds(Settings.EnabledMediaKinds);
         Settings.PlaybackSpeed = Math.Clamp(Settings.PlaybackSpeed, PlaybackSettings.MinPlaybackSpeed, PlaybackSettings.MaxPlaybackSpeed);
@@ -301,6 +526,14 @@ public sealed class PlaybackService(
             Settings.FavoriteShuffleWeight,
             PlaybackSettings.MinFavoriteShuffleWeight,
             PlaybackSettings.MaxFavoriteShuffleWeight);
+        Settings.DislikeShuffleWeight = Math.Clamp(
+            Settings.DislikeShuffleWeight,
+            PlaybackSettings.MinDislikeShuffleWeight,
+            PlaybackSettings.MaxDislikeShuffleWeight);
+        Settings.SuperLikeShuffleWeight = Math.Clamp(
+            Settings.SuperLikeShuffleWeight,
+            PlaybackSettings.MinSuperLikeShuffleWeight,
+            PlaybackSettings.MaxSuperLikeShuffleWeight);
 
         await settingsService.SaveAsync(Settings);
         SyncPlaylistShuffleCallbacks();
@@ -315,7 +548,11 @@ public sealed class PlaybackService(
         else if (Settings.PlaylistSource != previousPlaylistSource
             || Settings.EnabledMediaKinds != previousEnabledMediaKinds
             || Settings.BoostFavoritesInShuffle != previousBoostFavorites
-            || Settings.FavoriteShuffleWeight != previousFavoriteWeight)
+            || Math.Abs(Settings.FavoriteShuffleWeight - previousFavoriteWeight) > 0.001
+            || Settings.PenalizeDislikesInShuffle != previousPenalizeDislikes
+            || Math.Abs(Settings.DislikeShuffleWeight - previousDislikeWeight) > 0.001
+            || Settings.BoostSuperLikesInShuffle != previousBoostSuperLikes
+            || Math.Abs(Settings.SuperLikeShuffleWeight - previousSuperLikeWeight) > 0.001)
         {
             InvalidateShuffleState();
         }
@@ -326,8 +563,12 @@ public sealed class PlaybackService(
         if (playlistEligibilityChanged)
         {
             _favoritesEmptyNotified = false;
+            _dislikesEmptyNotified = false;
+            _superlikesEmptyNotified = false;
             _mediaKindsEmptyNotified = false;
             NotifyFavoritesOnlyEmptyIfNeeded();
+            NotifyDislikesOnlyEmptyIfNeeded();
+            NotifySuperLikesOnlyEmptyIfNeeded();
             NotifyMediaKindsFilterEmptyIfNeeded();
             SnapPlaylistCurrentToEligible();
             ResetSlotIndicesFromCurrent();
@@ -336,6 +577,19 @@ public sealed class PlaybackService(
         if (Settings.SplitScreenCount != previousSplitCount || Settings.LoopMode != previousLoopMode)
         {
             ResetSlotIndicesFromCurrent();
+        }
+
+        if (Settings.SplitScreenCount < previousSplitCount)
+        {
+            for (var i = Settings.SplitScreenCount; i < previousSplitCount && i < MaxSlots; i++)
+            {
+                _slotLocked[i] = false;
+
+                lock (_slotStateLock)
+                {
+                    _slotHistory[i].Clear();
+                }
+            }
         }
 
         if (Settings.AlwaysShowVideoInSplit != previousAlwaysShowVideo
@@ -375,7 +629,8 @@ public sealed class PlaybackService(
             || Settings.EnabledMediaKinds != previousEnabledMediaKinds
             || Math.Abs(Settings.PlaybackSpeed - previousSpeed) > 0.001
             || Math.Abs(Settings.ImageDurationSeconds - previousImageDuration) > 0.001
-            || Settings.GifRepeatCount != previousGifRepeats;
+            || Settings.GifRepeatCount != previousGifRepeats
+            || Settings.StaggerPaneTransitions != previousStagger;
 
         var onlyVolumeOrMuteChanged = !requiresVisibleSlotRefresh
             && (Math.Abs(Settings.Volume - previousVolume) > 0.001 || Settings.Muted != previousMuted);
@@ -460,6 +715,7 @@ public sealed class PlaybackService(
             toasts.Error($"Could not play {label}. Skipping.");
         }
 
+        debugLog.Debug($"Slot {slotIndex + 1} native end callback: reason={reason}; generation={playbackGeneration}; file={Path.GetFileName(completedPath)}; index={_slotIndices[slotIndex]}; current={GetSlotItem(slotIndex)?.DisplayName}.");
         _ = CompleteSlotAsync(slotIndex, completedPath, playbackGeneration);
     }
 
@@ -500,7 +756,15 @@ public sealed class PlaybackService(
 
         if (!string.IsNullOrWhiteSpace(expectedPath) && !string.Equals(item.FilePath, expectedPath, StringComparison.OrdinalIgnoreCase))
         {
-            debugLog.Trace($"Ignored stale slot {slotIndex + 1} completion: generation={playbackGeneration}; completed={Path.GetFileName(expectedPath)}; current={item.DisplayName}.");
+            debugLog.Info($"Ignored stale slot {slotIndex + 1} completion: generation={playbackGeneration}; completed={Path.GetFileName(expectedPath)}; current={item.DisplayName} ({item.Kind}).");
+            return;
+        }
+
+        // Image timers call CompleteSlotAsync with playbackGeneration=null. Ignore those
+        // when the slot has since switched to video, but allow manual skip (forceAdvance).
+        if (!forceAdvance && playbackGeneration is null && item.Kind == MediaKind.Video)
+        {
+            debugLog.Info($"Ignored slot {slotIndex + 1} image timer completion while slot shows video: item={item.DisplayName}.");
             return;
         }
 
@@ -515,6 +779,20 @@ public sealed class PlaybackService(
         if (playbackGeneration is not null && _slotNativeGenerations[slotIndex] is null)
         {
             debugLog.Trace($"Accepting slot {slotIndex + 1} completion with missing native generation because path still matches: completed={playbackGeneration}; item={item.DisplayName}.");
+        }
+
+        if (_slotLocked[slotIndex])
+        {
+            debugLog.Debug($"Slot {slotIndex + 1} locked; restarting {item.DisplayName}.");
+
+            if (slotIndex == 0)
+            {
+                VideoPosition = TimeSpan.Zero;
+                VideoDuration = TimeSpan.Zero;
+            }
+
+            await PlaySingleSlotAsync(slotIndex, forceRestartTimer: true, restartVideoIfSameSource: true);
+            return;
         }
 
         if (!forceAdvance && Settings.LoopMode == LoopMode.One)
@@ -538,6 +816,8 @@ public sealed class PlaybackService(
             if (GetEligiblePlaylistIndices(MediaKindRequirement.Any).Count == 0)
             {
                 NotifyFavoritesOnlyEmptyIfNeeded();
+                NotifyDislikesOnlyEmptyIfNeeded();
+                NotifySuperLikesOnlyEmptyIfNeeded();
                 NotifyMediaKindsFilterEmptyIfNeeded();
                 await StopAsync();
                 return;
@@ -547,6 +827,11 @@ public sealed class PlaybackService(
             {
                 await StopAsync();
                 return;
+            }
+
+            lock (_slotStateLock)
+            {
+                PushSlotHistoryLocked(slotIndex, _slotIndices[slotIndex]);
             }
 
             ResetSlotIndicesFromCurrent();
@@ -636,6 +921,12 @@ public sealed class PlaybackService(
                 continue;
             }
 
+            if (_slotLocked[sideSlot])
+            {
+                debugLog.Trace($"Side slot {sideSlot + 1} locked; skipping coupled advance.");
+                continue;
+            }
+
             var previousIndex = _slotIndices[sideSlot];
             if (!AdvanceSlotIndex(sideSlot))
             {
@@ -652,16 +943,32 @@ public sealed class PlaybackService(
 
     private TimeSpan GetSlotTimerStagger(int slotIndex)
     {
-        if (Settings.SplitScreenCount <= 1 || slotIndex < 0 || slotIndex >= MultiSplitTimerStaggerMs.Length)
+        if (Settings.SplitScreenCount <= 1 || slotIndex < 0 || slotIndex >= MaxSlots)
         {
             return TimeSpan.Zero;
         }
 
-        return TimeSpan.FromMilliseconds(MultiSplitTimerStaggerMs[slotIndex]);
+        if (!Settings.StaggerPaneTransitions || _slotStaggerApplied[slotIndex])
+        {
+            _slotStaggerApplied[slotIndex] = true;
+            return TimeSpan.FromMilliseconds(
+                MultiSplitTimerStaggerMs[Math.Min(slotIndex, MultiSplitTimerStaggerMs.Length - 1)]);
+        }
+
+        _slotStaggerApplied[slotIndex] = true;
+        var baseDuration = Settings.GetAdjustedImageDuration().TotalSeconds;
+        var offset = baseDuration / Settings.SplitScreenCount * slotIndex;
+        debugLog.Trace($"Slot {slotIndex + 1} phase stagger: {offset:0.##}s (duration={baseDuration:0.##}s / {Settings.SplitScreenCount} panes).");
+        return TimeSpan.FromSeconds(offset);
     }
 
     private async Task PlayVisibleSlotsAsync(bool forceRestartTimers)
     {
+        if (forceRestartTimers)
+        {
+            Array.Fill(_slotStaggerApplied, false);
+        }
+
         EnsureSlotIndices();
         debugLog.Trace($"Refreshing all visible slots. forceRestartTimers={forceRestartTimers}; slots={DescribeVisibleSlots()}; {Settings.FormatForDebugLogCompact()}.");
 
@@ -713,6 +1020,7 @@ public sealed class PlaybackService(
 
         var item = GetSlotItem(slotIndex);
         debugLog.Trace($"Refreshing slot {slotIndex + 1}. forceRestartTimer={forceRestartTimer}; restartVideoIfSameSource={restartVideoIfSameSource}; index={_slotIndices[slotIndex]}; item={item?.DisplayName} ({item?.Kind}); {Settings.FormatForDebugLogCompact()}.");
+        StopSlotTimer(slotIndex);
         await nativeVideoPlayback.PlaySlotAsync(slotIndex, item, Settings, restartVideoIfSameSource);
         await EnsureSlotTimerAsync(slotIndex, forceRestartTimer);
     }
@@ -819,13 +1127,28 @@ public sealed class PlaybackService(
 
                 await Task.Delay(duration, cancellationToken);
 
-                if (!cancellationToken.IsCancellationRequested
-                    && _slotTimerGenerations[slotIndex] == timerGeneration
-                    && GetSlotItem(slotIndex)?.Id == item.Id)
+                if (cancellationToken.IsCancellationRequested
+                    || _slotTimerGenerations[slotIndex] != timerGeneration)
                 {
-                    debugLog.Trace($"Slot {slotIndex + 1} timer fired for {item.DisplayName}; generation={timerGeneration}.");
-                    await CompleteSlotAsync(slotIndex, item.FilePath, playbackGeneration: null);
+                    return;
                 }
+
+                var current = GetSlotItem(slotIndex);
+
+                if (current is null || current.Id != item.Id)
+                {
+                    debugLog.Info($"Slot {slotIndex + 1} timer ignored for {item.DisplayName}; item changed (current={current?.DisplayName ?? "(none)"}).");
+                    return;
+                }
+
+                if (current.Kind is not (MediaKind.Image or MediaKind.Gif))
+                {
+                    debugLog.Info($"Slot {slotIndex + 1} timer ignored for {item.DisplayName}; slot now shows {current.Kind} ({current.DisplayName}).");
+                    return;
+                }
+
+                debugLog.Trace($"Slot {slotIndex + 1} timer fired for {item.DisplayName}; generation={timerGeneration}; duration={duration.TotalSeconds:0.##}s.");
+                await CompleteSlotAsync(slotIndex, item.FilePath, playbackGeneration: null);
             }
             catch (OperationCanceledException)
             {
@@ -936,6 +1259,7 @@ public sealed class PlaybackService(
             Array.Fill(_slotNativeGenerations, null);
             Array.Fill(_slotLastUnsatisfiableTraceIndex, -1);
             ResetSlotShuffleBagsLocked();
+            ClearSlotLockAndHistoryLocked();
 
             if (!playlistService.HasItems || playlistService.CurrentIndex < 0)
             {
@@ -980,6 +1304,7 @@ public sealed class PlaybackService(
                 return false;
             }
 
+            var outgoingIndex = _slotIndices[slotIndex];
             var items = playlistService.Items;
             var count = items.Count;
             var stride = Settings.SplitScreenCount;
@@ -997,8 +1322,11 @@ public sealed class PlaybackService(
             {
                 var shuffleRequirement = ComputeAdvanceRequirementForSlot(slotIndex);
 
-                if (TryAdvanceFromShuffleLocked(slotIndex, shuffleRequirement, out var shuffleIndex))
+                if (TryAdvanceFromShuffleLocked(slotIndex, shuffleRequirement, out var shuffleIndex)
+                    || (shuffleRequirement != MediaKindRequirement.Any
+                        && TryAdvanceFromShuffleLocked(slotIndex, MediaKindRequirement.Any, out shuffleIndex)))
                 {
+                    PushSlotHistoryLocked(slotIndex, outgoingIndex);
                     _slotIndices[slotIndex] = shuffleIndex;
                     return true;
                 }
@@ -1031,64 +1359,71 @@ public sealed class PlaybackService(
                 return false;
             }
 
+            bool advanced;
+
             if (!Settings.AlwaysShowVideoInSplit || stride <= 1)
             {
-                return TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
+                advanced = TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
             }
-
-            if (Settings.IsVideoIsolationActive)
+            else if (Settings.IsVideoIsolationActive)
             {
                 var requirement = Settings.GetSlotKindRequirement(slotIndex);
 
                 if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, requirement))
                 {
-                    return true;
+                    advanced = true;
                 }
-
-                if (TryFindNextIndex(slotIndex, strideCandidate + 1, requirement, out var found))
+                else if (TryFindNextIndex(slotIndex, strideCandidate + 1, requirement, out var found))
                 {
                     debugLog.Trace($"Slot {slotIndex + 1} stride candidate index={strideCandidate} ({items[strideCandidate].Kind}) violates {requirement}; walked to index={found} ({items[found].Kind}).");
                     _slotIndices[slotIndex] = found;
-                    return true;
+                    advanced = true;
                 }
-
-                if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                else if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
                 {
                     MaybeWarnUnsatisfiable(slotIndex, requirement);
-                    return true;
+                    advanced = true;
                 }
-
-                return false;
-            }
-
-            if (Settings.RequiresAtLeastOneVideo)
-            {
-                if (items[strideCandidate].Kind == MediaKind.Video
-                    || AnyActiveSlotIsVideo(exceptSlotIndex: slotIndex))
+                else
                 {
-                    if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
-                    {
-                        return true;
-                    }
+                    advanced = false;
                 }
-
-                if (TryFindNextIndex(slotIndex, strideCandidate + 1, MediaKindRequirement.VideoOnly, out var found))
+            }
+            else if (Settings.RequiresAtLeastOneVideo)
+            {
+                if ((items[strideCandidate].Kind == MediaKind.Video
+                     || AnyActiveSlotIsVideo(exceptSlotIndex: slotIndex))
+                    && TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                {
+                    advanced = true;
+                }
+                else if (TryFindNextIndex(slotIndex, strideCandidate + 1, MediaKindRequirement.VideoOnly, out var found))
                 {
                     debugLog.Trace($"Slot {slotIndex + 1} taking over video role; walked from index={strideCandidate} ({items[strideCandidate].Kind}) to index={found} (Video).");
                     _slotIndices[slotIndex] = found;
-                    return true;
+                    advanced = true;
                 }
-
-                if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
+                else if (TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any))
                 {
                     MaybeWarnUnsatisfiable(slotIndex, MediaKindRequirement.VideoOnly);
-                    return true;
+                    advanced = true;
                 }
-
-                return false;
+                else
+                {
+                    advanced = false;
+                }
+            }
+            else
+            {
+                advanced = TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
             }
 
-            return TryAdvanceSlotToIndex(slotIndex, strideCandidate, MediaKindRequirement.Any);
+            if (advanced)
+            {
+                PushSlotHistoryLocked(slotIndex, outgoingIndex);
+            }
+
+            return advanced;
         }
     }
 
@@ -1253,7 +1588,11 @@ public sealed class PlaybackService(
         try
         {
             await mediaSourceService.PrefetchThumbnailAsync(item);
-            await mediaSourceService.PrefetchImageAsync(item);
+
+            if (!mediaSourceService.UsesViewportThumbnailOnly(item))
+            {
+                await mediaSourceService.PrefetchImageAsync(item);
+            }
         }
         catch (Exception ex)
         {
@@ -1280,12 +1619,40 @@ public sealed class PlaybackService(
 
         if (Settings.RequiresAtLeastOneVideo)
         {
-            return AnyActiveSlotIsVideo(exceptSlotIndex: slotIndex)
-                ? MediaKindRequirement.Any
-                : MediaKindRequirement.VideoOnly;
+            if (AnyActiveSlotIsVideo(exceptSlotIndex: slotIndex))
+            {
+                return MediaKindRequirement.Any;
+            }
+
+            if (!PlaylistHasEligibleKindLocked(MediaKind.Video))
+            {
+                return MediaKindRequirement.Any;
+            }
+
+            // Only the primary pane hunts for a video while none is visible. Side panes
+            // keep a full shuffle bag (images + videos) so their bags are not empty when
+            // every eligible video index is already on another pane.
+            return slotIndex == 0 ? MediaKindRequirement.VideoOnly : MediaKindRequirement.Any;
         }
 
         return MediaKindRequirement.Any;
+    }
+
+    private bool PlaylistHasEligibleKindLocked(MediaKind kind)
+    {
+        AssertSlotStateLockHeld();
+
+        var items = playlistService.Items;
+
+        for (var index = 0; index < items.Count; index++)
+        {
+            if (IsPlaylistIndexEligibleForSource(index) && items[index].Kind == kind)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Pulls the next playlist index from the slot's independent shuffle bag, refilling
@@ -1406,6 +1773,12 @@ public sealed class PlaybackService(
 
         var requirement = ComputeAdvanceRequirementForSlot(slotIndex);
         var entries = BuildWeightedShuffleEntriesLocked(requirement);
+
+        if (entries.Count == 0 && requirement != MediaKindRequirement.Any)
+        {
+            debugLog.Trace($"Slot {slotIndex + 1} shuffle refill: no {requirement} entries; retrying Any.");
+            entries = BuildWeightedShuffleEntriesLocked(MediaKindRequirement.Any);
+        }
 
         for (var i = entries.Count - 1; i > 0; i--)
         {
@@ -1595,6 +1968,24 @@ public sealed class PlaybackService(
         NotifyChanged();
     }
 
+    private void OnSuperLikesChanged()
+    {
+        SyncPlaylistShuffleCallbacks();
+        InvalidateShuffleState();
+        ApplyPlaylistEligibilityToCurrentState();
+        NotifySuperLikesOnlyEmptyIfNeeded();
+        NotifyChanged();
+    }
+
+    private void OnDislikesChanged()
+    {
+        SyncPlaylistShuffleCallbacks();
+        InvalidateShuffleState();
+        NotifyDislikesOnlyEmptyIfNeeded();
+        ApplyPlaylistEligibilityToCurrentState();
+        NotifyChanged();
+    }
+
     private void ApplyPlaylistEligibilityToCurrentState()
     {
         if (!NeedsPlaylistIndexFilter() || !playlistService.HasItems)
@@ -1614,10 +2005,29 @@ public sealed class PlaybackService(
             return;
         }
 
-        if (Status == PlaybackStatus.Playing)
+        if (Status is PlaybackStatus.Playing or PlaybackStatus.Paused)
         {
-            ResetSlotIndicesFromCurrent();
-            _ = PlayVisibleSlotsAsync(forceRestartTimers: true);
+            bool anySlotChanged;
+
+            lock (_slotStateLock)
+            {
+                if (!_slotIndicesInitialized)
+                {
+                    return;
+                }
+
+                var before = new int[MaxSlots];
+                Array.Copy(_slotIndices, before, MaxSlots);
+                AlignSlotsToEligibilityLocked();
+                anySlotChanged = !before.AsSpan().SequenceEqual(_slotIndices);
+            }
+
+            if (anySlotChanged)
+            {
+                debugLog.Debug("Favorite/filter/dislike change displaced one or more slots; refreshing affected panes.");
+                _ = RefreshVisibleSlotsAfterEligibilityChangeAsync();
+            }
+
             return;
         }
 
@@ -1630,6 +2040,17 @@ public sealed class PlaybackService(
         }
     }
 
+    private async Task RefreshVisibleSlotsAfterEligibilityChangeAsync()
+    {
+        var wasPaused = Status == PlaybackStatus.Paused;
+        await PlayVisibleSlotsAsync(forceRestartTimers: true);
+
+        if (wasPaused)
+        {
+            await nativeVideoPlayback.PauseAsync();
+        }
+    }
+
     private void SyncPlaylistShuffleCallbacks()
     {
         playlistService.ShuffleIndexFilter = NeedsPlaylistIndexFilter()
@@ -1639,8 +2060,11 @@ public sealed class PlaybackService(
     }
 
     private bool NeedsPlaylistIndexFilter() =>
-        Settings.PlaylistSource == PlaylistSource.FavoritesOnly
-        || !Settings.IsAllMediaKindsEnabled;
+        Settings.PlaylistSource is PlaylistSource.FavoritesOnly
+            or PlaylistSource.DislikesOnly
+            or PlaylistSource.SuperLikesOnly
+        || !Settings.IsAllMediaKindsEnabled
+        || (dislikesService.Count > 0 && Settings.PenalizeDislikesInShuffle);
 
     private void InvalidateShuffleState()
     {
@@ -1666,6 +2090,38 @@ public sealed class PlaybackService(
 
         _favoritesEmptyNotified = true;
         toasts.Info("No favorites in this library. Heart items on a pane or switch back to All.");
+    }
+
+    private void NotifyDislikesOnlyEmptyIfNeeded()
+    {
+        if (Settings.PlaylistSource != PlaylistSource.DislikesOnly || DislikeCountInPlaylist > 0)
+        {
+            return;
+        }
+
+        if (_dislikesEmptyNotified)
+        {
+            return;
+        }
+
+        _dislikesEmptyNotified = true;
+        toasts.Info("No dislikes in this library. Use the broken heart on a pane or switch back to All.");
+    }
+
+    private void NotifySuperLikesOnlyEmptyIfNeeded()
+    {
+        if (Settings.PlaylistSource != PlaylistSource.SuperLikesOnly || SuperLikeCountInPlaylist > 0)
+        {
+            return;
+        }
+
+        if (_superlikesEmptyNotified)
+        {
+            return;
+        }
+
+        _superlikesEmptyNotified = true;
+        toasts.Info("No super likes in this library. Use super-like on a pane or switch back to All.");
     }
 
     private void NotifyMediaKindsFilterEmptyIfNeeded()
@@ -1734,18 +2190,40 @@ public sealed class PlaybackService(
             return favoritesService.IsFavorite(items[index].FilePath);
         }
 
+        if (Settings.PlaylistSource == PlaylistSource.DislikesOnly)
+        {
+            return dislikesService.IsDisliked(items[index].FilePath);
+        }
+
+        if (Settings.PlaylistSource == PlaylistSource.SuperLikesOnly)
+        {
+            return superLikesService.IsSuperLiked(items[index].FilePath);
+        }
+
+        if (IsDislikedIndexFullySuppressed(index))
+        {
+            return false;
+        }
+
         return true;
     }
 
-    private int GetShuffleWeightForIndex(int index)
+    private bool IsDislikedIndexFullySuppressed(int index)
     {
-        if (Settings.PlaylistSource != PlaylistSource.AllLibrary
-            || !Settings.Shuffle
-            || !Settings.BoostFavoritesInShuffle)
+        var items = playlistService.Items;
+
+        if (index < 0 || index >= items.Count)
         {
-            return 1;
+            return false;
         }
 
+        return dislikesService.IsDisliked(items[index].FilePath)
+            && Settings.GetDislikedShuffleCopyCount() == 0;
+    }
+
+    // Shuffle weight precedence: dislike copies → super-like → favorite → 1.
+    private int GetShuffleWeightForIndex(int index)
+    {
         var items = playlistService.Items;
 
         if (index < 0 || index >= items.Count)
@@ -1753,9 +2231,28 @@ public sealed class PlaybackService(
             return 1;
         }
 
-        return favoritesService.IsFavorite(items[index].FilePath)
-            ? Settings.FavoriteShuffleWeight
-            : 1;
+        if (dislikesService.IsDisliked(items[index].FilePath))
+        {
+            return Settings.GetDislikedShuffleCopyCount();
+        }
+
+        if (Settings.PlaylistSource == PlaylistSource.AllLibrary
+            && Settings.Shuffle
+            && Settings.BoostSuperLikesInShuffle
+            && superLikesService.IsSuperLiked(items[index].FilePath))
+        {
+            return Math.Max(1, (int)Math.Round(Settings.SuperLikeShuffleWeight));
+        }
+
+        if (Settings.PlaylistSource == PlaylistSource.AllLibrary
+            && Settings.Shuffle
+            && Settings.BoostFavoritesInShuffle
+            && favoritesService.IsFavorite(items[index].FilePath))
+        {
+            return Math.Max(1, (int)Math.Round(Settings.FavoriteShuffleWeight));
+        }
+
+        return 1;
     }
 
     private List<int> GetEligiblePlaylistIndices(MediaKindRequirement requirement)
@@ -2097,6 +2594,32 @@ public sealed class PlaybackService(
         }
     }
 
+    private void PushSlotHistoryLocked(int slotIndex, int outgoingPlaylistIndex)
+    {
+        if (outgoingPlaylistIndex < 0)
+        {
+            return;
+        }
+
+        var history = _slotHistory[slotIndex];
+        history.AddLast(outgoingPlaylistIndex);
+
+        while (history.Count > MaxSlotHistoryDepth)
+        {
+            history.RemoveFirst();
+        }
+    }
+
+    private void ClearSlotLockAndHistoryLocked()
+    {
+        Array.Fill(_slotLocked, false);
+
+        foreach (var h in _slotHistory)
+        {
+            h.Clear();
+        }
+    }
+
     private void NotifyChanged()
     {
         Changed?.Invoke();
@@ -2110,6 +2633,8 @@ public sealed class PlaybackService(
         nativeVideoPlayback.PlaybackStarted -= OnNativeVideoStarted;
         playlistService.Changed -= PruneImageCacheToPlaylist;
         favoritesService.Changed -= OnFavoritesChanged;
+        dislikesService.Changed -= OnDislikesChanged;
+        superLikesService.Changed -= OnSuperLikesChanged;
         return ValueTask.CompletedTask;
     }
 }

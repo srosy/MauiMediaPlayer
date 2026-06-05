@@ -8,8 +8,15 @@ window.mauiMediaPlayer = {
             dotNetReference.invokeMethodAsync('OnMediaDebugEvent', level, message).catch(() => { });
         };
 
-        image.onload = () => {
+        const reportLoaded = () => {
             log('INFO', `Image loaded: ${displayName}; naturalSize=${image.naturalWidth}x${image.naturalHeight}`);
+        };
+
+        image.onload = () => {
+            if (!image._mauiLoadLogged) {
+                image._mauiLoadLogged = true;
+                reportLoaded();
+            }
         };
 
         image.onerror = () => {
@@ -17,7 +24,8 @@ window.mauiMediaPlayer = {
         };
 
         if (image.complete && image.naturalWidth > 0) {
-            log('DEBUG', `Image already complete: ${displayName}; naturalSize=${image.naturalWidth}x${image.naturalHeight}`);
+            image._mauiLoadLogged = true;
+            reportLoaded();
         }
     },
 
@@ -88,7 +96,9 @@ window.mauiMediaPlayer = {
             return { x: 0, y: 0, width: 0, height: 0 };
         }
 
-        const rect = pane.getBoundingClientRect();
+        const zoomLayer = pane.querySelector('.media-pane-zoom-layer');
+        const isZoomed = zoomLayer?.classList.contains('is-zoomed') === true;
+        const paneRect = pane.getBoundingClientRect();
         const caption = pane.querySelector('.media-caption');
         const captionHeight = caption?.getBoundingClientRect().height ?? 0;
 
@@ -104,11 +114,33 @@ window.mauiMediaPlayer = {
         // holdover to the exact same region as the native MediaElement.
         pane.style.setProperty('--caption-inset', `${captionHeight}px`);
 
+        // Default: report the pane rect minus caption (existing behavior).
+        let rect = {
+            left: paneRect.left,
+            top: paneRect.top,
+            right: paneRect.right,
+            bottom: paneRect.bottom - captionHeight
+        };
+
+        // When the zoom layer is scaled, its post-transform bounding box can exceed
+        // the pane in any direction. Intersecting with the pane rect prevents the
+        // native MediaElement overlay from being positioned outside the pane (which
+        // would either hide it or paint over neighbour panes).
+        if (isZoomed && zoomLayer) {
+            const zoomRect = zoomLayer.getBoundingClientRect();
+            rect = {
+                left: Math.max(paneRect.left, zoomRect.left),
+                top: Math.max(paneRect.top, zoomRect.top),
+                right: Math.min(paneRect.right, zoomRect.right),
+                bottom: Math.min(paneRect.bottom - captionHeight, zoomRect.bottom)
+            };
+        }
+
         return {
             x: rect.left,
             y: rect.top,
-            width: rect.width,
-            height: Math.max(0, rect.height - captionHeight)
+            width: Math.max(0, rect.right - rect.left),
+            height: Math.max(0, rect.bottom - rect.top)
         };
     },
 
@@ -145,7 +177,7 @@ window.mauiMediaPlayer = {
             return;
         }
 
-        document.querySelectorAll('.media-pane:not(.is-video-pane) img.media-image-ready, .media-pane:not(.is-video-pane) img.media-image-holdover').forEach((image) => {
+        document.querySelectorAll('.media-pane:not(.is-video-pane) img.media-image-ready').forEach((image) => {
             if (image._mauiImageWatched) {
                 return;
             }
@@ -166,7 +198,664 @@ window.mauiMediaPlayer = {
                 pane._mauiBoundsObserved = true;
                 observer.observe(pane);
             }
+
+            const zoomLayer = pane.querySelector('.media-pane-zoom-layer');
+            if (zoomLayer && !zoomLayer._mauiBoundsObserved) {
+                zoomLayer._mauiBoundsObserved = true;
+                observer.observe(zoomLayer);
+            }
         });
+    },
+
+    installPaneZoom() {
+        // Idempotent install: reuse existing state so per-pane content changes
+        // (which re-trigger this from MediaViewport.OnAfterRenderAsync) don't wipe
+        // active zoom or detach the wheel handler from panes that are still mounted.
+        // We only attach a wheel listener to panes that don't already have one.
+        let state = window._mauiMediaPlayerPaneZoom;
+        if (state) {
+            document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+                if (pane._mauiPaneZoomWheel) {
+                    return;
+                }
+
+                pane._mauiPaneZoomWheel = state.wheelHandler;
+                pane.addEventListener('wheel', state.wheelHandler, { passive: false });
+            });
+            return;
+        }
+
+        const minScale = 1;
+        const maxScale = 4;
+        const wheelStep = 0.12;
+        const releaseTolerancePx = 80;
+
+        state = {
+            slots: [null, null, null],
+            activeSlot: null,
+            wheelHandler: null,
+            moveHandler: null
+        };
+
+        const getLayer = (slotIndex) =>
+            document.querySelector(`[data-media-pane][data-slot="${slotIndex}"] .media-pane-zoom-layer`);
+
+        const resetPaneZoom = (slotIndex, requestFlush) => {
+            const layer = getLayer(slotIndex);
+            const slotState = state.slots[slotIndex];
+
+            if (slotState) {
+                slotState.scale = minScale;
+            }
+
+            if (layer) {
+                layer.style.transform = '';
+                layer.style.transformOrigin = '';
+                layer.classList.remove('is-zoomed');
+            }
+
+            if (state.activeSlot === slotIndex) {
+                state.activeSlot = null;
+            }
+
+            if (requestFlush) {
+                window.mauiMediaPlayer.requestMediaPaneBoundsFlush();
+            }
+        };
+
+        const resetAllPaneZoom = (requestFlush) => {
+            for (let slotIndex = 0; slotIndex < 3; slotIndex++) {
+                resetPaneZoom(slotIndex, false);
+            }
+
+            state.activeSlot = null;
+
+            if (requestFlush) {
+                window.mauiMediaPlayer.requestMediaPaneBoundsFlush();
+            }
+        };
+
+        const applyZoom = (slotIndex, layer, slotState) => {
+            layer.style.transformOrigin = `${slotState.originX}px ${slotState.originY}px`;
+            layer.style.transform = `scale(${slotState.scale})`;
+            layer.classList.toggle('is-zoomed', slotState.scale > minScale + 0.001);
+            window.mauiMediaPlayer.requestMediaPaneBoundsFlush();
+        };
+
+        state.wheelHandler = (event) => {
+            const pane = event.currentTarget;
+            const slotIndex = Number.parseInt(pane.getAttribute('data-slot') ?? '', 10);
+
+            if (Number.isNaN(slotIndex) || slotIndex < 0 || slotIndex > 2) {
+                return;
+            }
+
+            // Caption row hosts scrollable/click controls (back, skip, etc.).
+            // Don't hijack wheel events that originate over the caption.
+            if (typeof event.target?.closest === 'function'
+                && event.target.closest('.media-caption')) {
+                return;
+            }
+
+            const layer = getLayer(slotIndex);
+            if (!layer) {
+                return;
+            }
+
+            event.preventDefault();
+
+            if (state.activeSlot !== null && state.activeSlot !== slotIndex) {
+                resetPaneZoom(state.activeSlot, false);
+            }
+
+            let slotState = state.slots[slotIndex];
+            if (!slotState) {
+                slotState = {
+                    scale: minScale,
+                    anchorClientX: event.clientX,
+                    anchorClientY: event.clientY,
+                    originX: 0,
+                    originY: 0
+                };
+                state.slots[slotIndex] = slotState;
+            }
+
+            const layerRect = layer.getBoundingClientRect();
+            slotState.originX = event.clientX - layerRect.left;
+            slotState.originY = event.clientY - layerRect.top;
+
+            if (slotState.scale <= minScale + 0.001) {
+                slotState.anchorClientX = event.clientX;
+                slotState.anchorClientY = event.clientY;
+            }
+
+            const delta = event.deltaY < 0 ? wheelStep : -wheelStep;
+            slotState.scale = Math.min(maxScale, Math.max(minScale, slotState.scale + delta));
+
+            if (slotState.scale <= minScale + 0.001) {
+                resetPaneZoom(slotIndex, true);
+                return;
+            }
+
+            state.activeSlot = slotIndex;
+            applyZoom(slotIndex, layer, slotState);
+        };
+
+        state.moveHandler = (event) => {
+            const active = state.activeSlot;
+            if (active === null) {
+                return;
+            }
+
+            const slotState = state.slots[active];
+            if (!slotState || slotState.scale <= minScale + 0.001) {
+                return;
+            }
+
+            const dx = event.clientX - slotState.anchorClientX;
+            const dy = event.clientY - slotState.anchorClientY;
+            if (Math.hypot(dx, dy) > releaseTolerancePx) {
+                resetPaneZoom(active, true);
+            }
+        };
+
+        document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+            if (pane._mauiPaneZoomWheel) {
+                pane.removeEventListener('wheel', pane._mauiPaneZoomWheel);
+            }
+
+            pane._mauiPaneZoomWheel = state.wheelHandler;
+            pane.addEventListener('wheel', state.wheelHandler, { passive: false });
+        });
+
+        document.addEventListener('pointermove', state.moveHandler, { passive: true });
+        window._mauiMediaPlayerPaneZoom = state;
+    },
+
+    disposePaneZoom() {
+        const state = window._mauiMediaPlayerPaneZoom;
+        if (!state) {
+            return;
+        }
+
+        document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+            if (pane._mauiPaneZoomWheel) {
+                pane.removeEventListener('wheel', pane._mauiPaneZoomWheel);
+                delete pane._mauiPaneZoomWheel;
+            }
+        });
+
+        if (state.moveHandler) {
+            document.removeEventListener('pointermove', state.moveHandler);
+        }
+
+        for (let slotIndex = 0; slotIndex < 3; slotIndex++) {
+            const layer = document.querySelector(
+                `[data-media-pane][data-slot="${slotIndex}"] .media-pane-zoom-layer`);
+            if (layer) {
+                layer.style.transform = '';
+                layer.style.transformOrigin = '';
+                layer.classList.remove('is-zoomed');
+                delete layer._mauiBoundsObserved;
+            }
+        }
+
+        window._mauiMediaPlayerPaneZoom = null;
+    },
+
+    _paneSwapDrag: null,
+
+    _paneSwapLog(dotNetReference, level, message) {
+        if (!dotNetReference) {
+            return;
+        }
+
+        dotNetReference.invokeMethodAsync('OnMediaDebugEvent', level, `PaneSwap: ${message}`).catch(() => { });
+    },
+
+    _setupPaneSwapDragSession(dotNetReference, sourceSlot, startX, startY, thresholdPx, ghostOffsetPx, options) {
+        const threshold = typeof thresholdPx === 'number' && thresholdPx > 0 ? thresholdPx : 8;
+        const ghostOffset = typeof ghostOffsetPx === 'number' ? ghostOffsetPx : 18;
+        const nativeDriven = options?.nativeDriven === true;
+        const log = (level, msg) => this._paneSwapLog(dotNetReference, level, msg);
+
+        const viewport = document.querySelector('.media-viewport');
+        if (!viewport) {
+            log('ERROR', 'JS session begin failed — .media-viewport not found.');
+            dotNetReference.invokeMethodAsync(
+                'OnPaneSwapDragComplete',
+                sourceSlot,
+                -1,
+                false,
+                'begin-failed').catch(() => { });
+            return null;
+        }
+
+        const sourcePane = document.querySelector(`[data-media-pane][data-slot="${sourceSlot}"]`);
+        let armed = false;
+        let dropTarget = -1;
+        let ghostEl = null;
+        let lastMoveLogAt = 0;
+
+        const clearDropTarget = () => {
+            document.querySelectorAll('.media-pane.is-pane-drop-target').forEach((pane) => {
+                pane.classList.remove('is-pane-drop-target');
+            });
+            dropTarget = -1;
+        };
+
+        const setDropTarget = (slot) => {
+            const next = typeof slot === 'number' && slot >= 0 && slot !== sourceSlot ? slot : -1;
+            if (next === dropTarget) {
+                return;
+            }
+
+            clearDropTarget();
+            dropTarget = next;
+
+            if (next >= 0) {
+                const pane = document.querySelector(`[data-media-pane][data-slot="${next}"]`);
+                pane?.classList.add('is-pane-drop-target');
+            }
+
+            log('DEBUG', `drop target ${next >= 0 ? `slot ${next + 1}` : 'none'} (source slot ${sourceSlot + 1}).`);
+        };
+
+        const createGhost = () => {
+            ghostEl = document.createElement('div');
+            ghostEl.className = 'media-pane-drag-ghost';
+
+            const img = sourcePane?.querySelector(
+                '.media-pane-zoom-layer img.media-image-ready, .media-pane-zoom-layer img.media-image-holdover');
+            if (img) {
+                const clone = img.cloneNode(true);
+                clone.removeAttribute('id');
+                ghostEl.appendChild(clone);
+            } else {
+                const title = sourcePane?.querySelector('.media-caption-title')?.textContent?.trim() ?? '';
+                const fallback = document.createElement('div');
+                fallback.className = 'media-pane-drag-ghost-fallback';
+                if (sourcePane?.classList.contains('is-video-pane')) {
+                    const film = document.createElement('span');
+                    film.textContent = 'Video';
+                    film.style.opacity = '0.55';
+                    fallback.appendChild(film);
+                }
+
+                if (title) {
+                    const titleEl = document.createElement('span');
+                    titleEl.className = 'media-pane-drag-ghost-title';
+                    titleEl.textContent = title;
+                    fallback.appendChild(titleEl);
+                }
+
+                ghostEl.appendChild(fallback);
+            }
+
+            document.body.appendChild(ghostEl);
+        };
+
+        const moveGhost = (clientX, clientY) => {
+            if (!ghostEl) {
+                return;
+            }
+
+            ghostEl.style.left = `${clientX + ghostOffset}px`;
+            ghostEl.style.top = `${clientY + ghostOffset}px`;
+        };
+
+        const hitTestSlot = (clientX, clientY, logDetails) => {
+            if (ghostEl) {
+                ghostEl.style.pointerEvents = 'none';
+            }
+
+            const hit = document.elementFromPoint(clientX, clientY);
+            const pane = hit?.closest?.('[data-media-pane][data-slot]');
+            if (!pane) {
+                if (logDetails) {
+                    const hitLabel = hit
+                        ? `${hit.tagName}${hit.className ? '.' + String(hit.className).trim().split(/\s+/).slice(0, 2).join('.') : ''}`
+                        : '(none)';
+                    log('DEBUG', `hit-test miss at (${clientX.toFixed(0)},${clientY.toFixed(0)}); top=${hitLabel}.`);
+                }
+
+                return -1;
+            }
+
+            const slotIndex = Number.parseInt(pane.getAttribute('data-slot') ?? '', 10);
+            const resolved = Number.isNaN(slotIndex) ? -1 : slotIndex;
+
+            if (logDetails) {
+                log('DEBUG', `hit-test at (${clientX.toFixed(0)},${clientY.toFixed(0)}) → slot ${resolved >= 0 ? resolved + 1 : '—'}.`);
+            }
+
+            return resolved;
+        };
+
+        const armDrag = () => {
+            armed = true;
+            viewport.classList.add('is-pane-swap-active');
+            sourcePane?.classList.add('is-pane-drag-source');
+            createGhost();
+            log('DEBUG', `armed; source slot ${sourceSlot + 1}.`);
+            dotNetReference.invokeMethodAsync('OnPaneSwapDragArmed', sourceSlot).catch(() => { });
+        };
+
+        const finishDrag = (reason, clientX, clientY) => {
+            const session = this._paneSwapDrag;
+            if (!session || session.sourceSlot !== sourceSlot) {
+                return;
+            }
+
+            if (!nativeDriven && session.pointerId !== options?.pointerId) {
+                return;
+            }
+
+            if (session.onMove) {
+                window.removeEventListener('pointermove', session.onMove, { capture: true });
+            }
+
+            if (session.onUp) {
+                window.removeEventListener('pointerup', session.onUp, { capture: true });
+            }
+
+            if (armed) {
+                const releaseHit = hitTestSlot(clientX, clientY, true);
+                if (releaseHit >= 0 && releaseHit !== sourceSlot) {
+                    dropTarget = releaseHit;
+                }
+            }
+
+            const targetSlot = armed ? dropTarget : -1;
+
+            sourcePane?.classList.remove('is-pane-drag-source');
+            clearDropTarget();
+            viewport.classList.remove('is-pane-swap-active');
+            ghostEl?.remove();
+            ghostEl = null;
+
+            log('DEBUG', `JS session end (${reason}); armed=${armed}; source=${sourceSlot + 1}; target=${targetSlot >= 0 ? targetSlot + 1 : 'none'}.`);
+
+            this._paneSwapDrag = null;
+
+            dotNetReference.invokeMethodAsync(
+                'OnPaneSwapDragComplete',
+                sourceSlot,
+                targetSlot,
+                armed,
+                reason).catch(() => { });
+        };
+
+        const moveTo = (clientX, clientY) => {
+            if (!armed) {
+                const dx = clientX - startX;
+                const dy = clientY - startY;
+                if (dx * dx + dy * dy < threshold * threshold) {
+                    return false;
+                }
+
+                armDrag();
+            }
+
+            moveGhost(clientX, clientY);
+
+            const now = performance.now();
+            const logDetails = now - lastMoveLogAt > 400;
+            if (logDetails) {
+                lastMoveLogAt = now;
+            }
+
+            setDropTarget(hitTestSlot(clientX, clientY, logDetails));
+
+            if (logDetails) {
+                log('TRACE', `move at=(${clientX.toFixed(0)},${clientY.toFixed(0)}); target=${dropTarget >= 0 ? dropTarget + 1 : '—'}.`);
+            }
+
+            return armed;
+        };
+
+        return {
+            nativeDriven,
+            sourceSlot,
+            dotNetReference,
+            threshold,
+            startX,
+            startY,
+            moveTo,
+            finishDrag,
+            isArmed: () => armed
+        };
+    },
+
+    // Document-level pointer listeners during pane drag-swap. Drag visuals (ghost,
+    // source dim, drop-target ring) are applied purely in JS so Blazor never
+    // re-renders mid-drag — a StateHasChanged during capture causes pointercancel
+    // in WebView2 and kills the session.
+    startPaneSwapDrag(dotNetReference, pointerId, sourceSlot, startX, startY, thresholdPx, ghostOffsetPx) {
+        this.stopPaneSwapDrag(dotNetReference, 'restart');
+
+        const log = (level, msg) => this._paneSwapLog(dotNetReference, level, msg);
+        log('DEBUG', `JS session begin; pointerId=${pointerId}; sourceSlot=${sourceSlot + 1}; at=(${startX.toFixed(0)},${startY.toFixed(0)}).`);
+
+        const core = this._setupPaneSwapDragSession(
+            dotNetReference,
+            sourceSlot,
+            startX,
+            startY,
+            thresholdPx,
+            ghostOffsetPx,
+            { nativeDriven: false, pointerId });
+
+        if (!core) {
+            return;
+        }
+
+        const onMove = (event) => {
+            if (event.pointerId !== pointerId) {
+                return;
+            }
+
+            event.preventDefault();
+            core.moveTo(event.clientX, event.clientY);
+        };
+
+        const onUp = (event) => {
+            if (event.pointerId !== pointerId) {
+                return;
+            }
+
+            event.preventDefault();
+            core.finishDrag('up', event.clientX, event.clientY);
+        };
+
+        // Do NOT listen for pointercancel — WebView2 fires spurious cancels when Blazor
+        // re-renders or when native overlays participate. pointerup always follows a real release.
+        window.addEventListener('pointermove', onMove, { capture: true });
+        window.addEventListener('pointerup', onUp, { capture: true });
+
+        this._paneSwapDrag = {
+            pointerId,
+            onMove,
+            onUp,
+            sourceSlot,
+            dotNetReference,
+            finishDrag: core.finishDrag
+        };
+    },
+
+    // Native MediaElement pan gestures cannot reach the WebView pointer pipeline.
+    // MainPage forwards move/up in WebView client coordinates via these entry points.
+    startPaneSwapDragFromNative(dotNetReference, sourceSlot, startX, startY, thresholdPx, ghostOffsetPx) {
+        this.stopPaneSwapDrag(dotNetReference, 'restart');
+
+        const log = (level, msg) => this._paneSwapLog(dotNetReference, level, msg);
+        log('DEBUG', `JS native session begin; sourceSlot=${sourceSlot + 1}; at=(${startX.toFixed(0)},${startY.toFixed(0)}).`);
+
+        const core = this._setupPaneSwapDragSession(
+            dotNetReference,
+            sourceSlot,
+            startX,
+            startY,
+            thresholdPx,
+            ghostOffsetPx,
+            { nativeDriven: true });
+
+        if (!core) {
+            return;
+        }
+
+        this._paneSwapDrag = {
+            nativeDriven: true,
+            sourceSlot,
+            dotNetReference,
+            moveTo: core.moveTo,
+            finishDrag: core.finishDrag
+        };
+    },
+
+    updatePaneSwapDragFromNative(clientX, clientY) {
+        const session = this._paneSwapDrag;
+        if (!session?.nativeDriven || typeof session.moveTo !== 'function') {
+            return;
+        }
+
+        session.moveTo(clientX, clientY);
+    },
+
+    finishPaneSwapDragFromNative(clientX, clientY, reason) {
+        const session = this._paneSwapDrag;
+        if (!session?.nativeDriven || typeof session.finishDrag !== 'function') {
+            return;
+        }
+
+        session.finishDrag(reason || 'native-up', clientX, clientY);
+    },
+
+    stopPaneSwapDrag(dotNetReference, reason) {
+        const session = this._paneSwapDrag;
+        if (!session) {
+            return;
+        }
+
+        if (session.onMove) {
+            window.removeEventListener('pointermove', session.onMove, { capture: true });
+        }
+
+        if (session.onUp) {
+            window.removeEventListener('pointerup', session.onUp, { capture: true });
+        }
+
+        document.querySelector('.media-viewport')?.classList.remove('is-pane-swap-active');
+        document.querySelectorAll('.media-pane.is-pane-drag-source').forEach((pane) => {
+            pane.classList.remove('is-pane-drag-source');
+        });
+        document.querySelectorAll('.media-pane.is-pane-drop-target').forEach((pane) => {
+            pane.classList.remove('is-pane-drop-target');
+        });
+        document.querySelectorAll('.media-pane-drag-ghost').forEach((ghost) => {
+            ghost.remove();
+        });
+
+        const sessionLabel = session.nativeDriven
+            ? 'native'
+            : `pointerId=${session.pointerId}`;
+        this._paneSwapLog(dotNetReference ?? session.dotNetReference, 'DEBUG', `JS session aborted (${reason}); ${sessionLabel}.`);
+        this._paneSwapDrag = null;
+    },
+
+    // Resolves which media pane sits under the cursor. Used during pane drag-swap
+    // because setPointerCapture on the viewport retargets pointer events away from
+    // child panes, so Blazor pointerenter/leave on zoom layers never fire.
+    getMediaPaneSlotAtPoint(clientX, clientY, dotNetReference, logDetails) {
+        if (typeof clientX !== 'number' || typeof clientY !== 'number') {
+            if (logDetails) {
+                this._paneSwapLog(dotNetReference, 'DEBUG', 'hit-test rejected — invalid coordinates.');
+            }
+
+            return -1;
+        }
+
+        const hit = document.elementFromPoint(clientX, clientY);
+        const pane = hit?.closest?.('[data-media-pane][data-slot]');
+        if (!pane) {
+            if (logDetails) {
+                const hitLabel = hit
+                    ? `${hit.tagName}${hit.className ? '.' + String(hit.className).trim().split(/\s+/).slice(0, 2).join('.') : ''}`
+                    : '(none)';
+                this._paneSwapLog(dotNetReference, 'DEBUG', `hit-test miss at (${clientX.toFixed(0)},${clientY.toFixed(0)}); top=${hitLabel}.`);
+            }
+
+            return -1;
+        }
+
+        const slotIndex = Number.parseInt(pane.getAttribute('data-slot') ?? '', 10);
+        const resolved = Number.isNaN(slotIndex) ? -1 : slotIndex;
+
+        if (logDetails) {
+            this._paneSwapLog(
+                dotNetReference,
+                'DEBUG',
+                `hit-test at (${clientX.toFixed(0)},${clientY.toFixed(0)}) → slot ${resolved >= 0 ? resolved + 1 : '—'}.`);
+        }
+
+        return resolved;
+    },
+
+    // Legacy entry points kept for any stale callers.
+    setViewportPointerCapture(pointerId) {
+        if (typeof pointerId !== 'number' || pointerId < 0) {
+            return;
+        }
+
+        const viewport = document.querySelector('.media-viewport');
+        if (!viewport || typeof viewport.setPointerCapture !== 'function') {
+            return;
+        }
+
+        try {
+            viewport.setPointerCapture(pointerId);
+        } catch (_) {
+        }
+    },
+
+    releaseViewportPointerCapture(pointerId) {
+        if (typeof pointerId !== 'number' || pointerId < 0) {
+            return;
+        }
+
+        const viewport = document.querySelector('.media-viewport');
+        if (!viewport || typeof viewport.releasePointerCapture !== 'function') {
+            return;
+        }
+
+        try {
+            if (viewport.hasPointerCapture?.(pointerId)) {
+                viewport.releasePointerCapture(pointerId);
+            }
+        } catch (_) {
+        }
+    },
+
+    invalidatePaneZoom() {
+        const state = window._mauiMediaPlayerPaneZoom;
+        if (!state) {
+            return;
+        }
+
+        for (let slotIndex = 0; slotIndex < 3; slotIndex++) {
+            const layer = document.querySelector(
+                `[data-media-pane][data-slot="${slotIndex}"] .media-pane-zoom-layer`);
+            if (layer) {
+                layer.style.transform = '';
+                layer.style.transformOrigin = '';
+                layer.classList.remove('is-zoomed');
+            }
+
+            state.slots[slotIndex] = null;
+        }
+
+        state.activeSlot = null;
+        window.mauiMediaPlayer.requestMediaPaneBoundsFlush();
     },
 
     observeMediaViewportBounds(dotNetReference) {
@@ -242,6 +931,8 @@ window.mauiMediaPlayer = {
     },
 
     disposeMediaViewportBoundsObserver() {
+        window.mauiMediaPlayer.disposePaneZoom();
+
         if (window._mauiMediaPlayerBoundsNotifyTimer) {
             clearTimeout(window._mauiMediaPlayerBoundsNotifyTimer);
             window._mauiMediaPlayerBoundsNotifyTimer = null;

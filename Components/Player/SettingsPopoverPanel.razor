@@ -59,6 +59,18 @@
                step="1"
                value="@Playback.Settings.GifRepeatCount"
                @onchange="SetGifRepeatsAsync" />
+
+        <div class="form-check mt-2">
+            <input id="settingsStaggerTransitions"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.StaggerPaneTransitions"
+                   disabled="@(Playback.Settings.SplitScreenCount <= 1)"
+                   @onchange="SetStaggerTransitionsAsync" />
+            <label class="form-check-label" for="settingsStaggerTransitions">
+                Stagger pane transitions
+            </label>
+        </div>
     </div>
 
     @if (Playback.Settings.SplitScreenMode != SplitScreenMode.Single)
@@ -148,17 +160,90 @@
         </div>
 
         <label class="form-label mt-2" for="settingsFavoriteWeight">
-            Favorite frequency: @Playback.Settings.FavoriteShuffleWeight&times;
+            Favorite frequency: @Playback.Settings.FavoriteShuffleWeight.ToString("0.##")&times;
         </label>
         <input id="settingsFavoriteWeight"
                class="form-range"
                type="range"
                min="@PlaybackSettings.MinFavoriteShuffleWeight"
                max="@PlaybackSettings.MaxFavoriteShuffleWeight"
-               step="1"
+               step="0.25"
                value="@Playback.Settings.FavoriteShuffleWeight"
                disabled="@(!CanAdjustFavoriteWeight)"
                @onchange="SetFavoriteWeightAsync" />
+
+        <div class="form-check mt-2">
+            <input id="settingsPenalizeDislikes"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.PenalizeDislikesInShuffle"
+                   disabled="@(!CanPenalizeDislikesInShuffle)"
+                   @onchange="SetPenalizeDislikesAsync" />
+            <label class="form-check-label" for="settingsPenalizeDislikes"
+                   title="@(CanPenalizeDislikesInShuffle ? null : "Available when playing all library with shuffle on.")">
+                Reduce disliked items in shuffle
+            </label>
+        </div>
+
+        <label class="form-label mt-2" for="settingsDislikeWeight">
+            Disliked frequency: @Playback.Settings.GetDislikedShuffleDisplayFrequency().ToString("0.##")&times;
+        </label>
+        <input id="settingsDislikeWeight"
+               class="form-range"
+               type="range"
+               min="@PlaybackSettings.MinDislikeShuffleWeight"
+               max="@PlaybackSettings.MaxDislikeShuffleWeight"
+               step="0.25"
+               value="@Playback.Settings.DislikeShuffleWeight"
+               disabled="@(!CanAdjustDislikeWeight)"
+               @onchange="SetDislikeWeightAsync" />
+        <div class="form-text">
+            1&times; hides disliked items from shuffle. Higher values show them more often (up to 5&times;).
+        </div>
+
+        <div class="form-check mt-2">
+            <input id="settingsBackRemovesDislike"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.BackButtonRemovesDislike"
+                   @onchange="SetBackButtonRemovesDislikeAsync" />
+            <label class="form-check-label" for="settingsBackRemovesDislike">
+                Go back removes dislike on current item
+            </label>
+        </div>
+    </div>
+
+    <div class="app-popover-row">
+        <div class="app-popover-title">Super likes</div>
+
+        <div class="form-check">
+            <input id="settingsBoostSuperLikes"
+                   class="form-check-input"
+                   type="checkbox"
+                   checked="@Playback.Settings.BoostSuperLikesInShuffle"
+                   disabled="@(!CanBoostSuperLikesInShuffle)"
+                   @onchange="SetBoostSuperLikesAsync" />
+            <label class="form-check-label" for="settingsBoostSuperLikes"
+                   title="@(CanBoostSuperLikesInShuffle ? null : "Available when playing all library with shuffle on.")">
+                Boost super likes in shuffle
+            </label>
+        </div>
+
+        <label class="form-label mt-2" for="settingsSuperLikeWeight">
+            Super-like frequency: @Playback.Settings.SuperLikeShuffleWeight.ToString("0.##")&times;
+        </label>
+        <input id="settingsSuperLikeWeight"
+               class="form-range"
+               type="range"
+               min="@PlaybackSettings.MinSuperLikeShuffleWeight"
+               max="@PlaybackSettings.MaxSuperLikeShuffleWeight"
+               step="0.25"
+               value="@Playback.Settings.SuperLikeShuffleWeight"
+               disabled="@(!CanAdjustSuperLikeWeight)"
+               @onchange="SetSuperLikeWeightAsync" />
+        <div class="form-text">
+            Higher values make super-liked items appear more often in shuffle (up to 10&times;).
+        </div>
     </div>
 
     <div class="app-popover-row">
@@ -211,6 +296,9 @@
             ? Playback.UpdateSettingsAsync(s => s.GifRepeatCount = count)
             : Task.CompletedTask;
 
+    private Task SetStaggerTransitionsAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.StaggerPaneTransitions = args.Value is bool enabled && enabled);
+
     private Task SetAlwaysShowVideoAsync(ChangeEventArgs args) =>
         Playback.UpdateSettingsAsync(s => s.AlwaysShowVideoInSplit = args.Value is bool enabled && enabled);
 
@@ -238,18 +326,59 @@
     private bool CanAdjustFavoriteWeight =>
         CanBoostFavoritesInShuffle && Playback.Settings.BoostFavoritesInShuffle;
 
+    private bool CanPenalizeDislikesInShuffle => CanBoostFavoritesInShuffle;
+
+    private bool CanAdjustDislikeWeight =>
+        CanPenalizeDislikesInShuffle && Playback.Settings.PenalizeDislikesInShuffle;
+
+    private bool CanBoostSuperLikesInShuffle => CanBoostFavoritesInShuffle;
+
+    private bool CanAdjustSuperLikeWeight =>
+        CanBoostSuperLikesInShuffle && Playback.Settings.BoostSuperLikesInShuffle;
+
+    private Task SetBackButtonRemovesDislikeAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.BackButtonRemovesDislike = args.Value is bool enabled && enabled);
+
     private Task SetBoostFavoritesAsync(ChangeEventArgs args) =>
         Playback.UpdateSettingsAsync(s => s.BoostFavoritesInShuffle = args.Value is bool enabled && enabled);
 
     private Task SetFavoriteWeightAsync(ChangeEventArgs args)
     {
-        if (!int.TryParse(args.Value?.ToString(), out var weight))
+        if (!double.TryParse(args.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var weight))
         {
             return Task.CompletedTask;
         }
 
         weight = Math.Clamp(weight, PlaybackSettings.MinFavoriteShuffleWeight, PlaybackSettings.MaxFavoriteShuffleWeight);
         return Playback.UpdateSettingsAsync(s => s.FavoriteShuffleWeight = weight);
+    }
+
+    private Task SetPenalizeDislikesAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.PenalizeDislikesInShuffle = args.Value is bool enabled && enabled);
+
+    private Task SetDislikeWeightAsync(ChangeEventArgs args)
+    {
+        if (!double.TryParse(args.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var weight))
+        {
+            return Task.CompletedTask;
+        }
+
+        weight = Math.Clamp(weight, PlaybackSettings.MinDislikeShuffleWeight, PlaybackSettings.MaxDislikeShuffleWeight);
+        return Playback.UpdateSettingsAsync(s => s.DislikeShuffleWeight = weight);
+    }
+
+    private Task SetBoostSuperLikesAsync(ChangeEventArgs args) =>
+        Playback.UpdateSettingsAsync(s => s.BoostSuperLikesInShuffle = args.Value is bool enabled && enabled);
+
+    private Task SetSuperLikeWeightAsync(ChangeEventArgs args)
+    {
+        if (!double.TryParse(args.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var weight))
+        {
+            return Task.CompletedTask;
+        }
+
+        weight = Math.Clamp(weight, PlaybackSettings.MinSuperLikeShuffleWeight, PlaybackSettings.MaxSuperLikeShuffleWeight);
+        return Playback.UpdateSettingsAsync(s => s.SuperLikeShuffleWeight = weight);
     }
 
     private void OnChanged() => _ = InvokeAsync(StateHasChanged);
