@@ -194,6 +194,44 @@ public sealed class SettingsService
         return Task.CompletedTask;
     }
 
+    public async Task MigratePathAsync(string oldPath, string newPath)
+    {
+        if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath))
+        {
+            return;
+        }
+
+        var lastPaths = (await GetLastMediaPathsAsync()).ToList();
+        var recentPaths = (await GetRecentPathsAsync()).ToList();
+        var changed = false;
+
+        for (var index = 0; index < lastPaths.Count; index++)
+        {
+            if (string.Equals(lastPaths[index], oldPath, StringComparison.OrdinalIgnoreCase))
+            {
+                lastPaths[index] = newPath;
+                changed = true;
+            }
+        }
+
+        for (var index = 0; index < recentPaths.Count; index++)
+        {
+            if (string.Equals(recentPaths[index], oldPath, StringComparison.OrdinalIgnoreCase))
+            {
+                recentPaths[index] = newPath;
+                changed = true;
+            }
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        Preferences.Default.Set(LastMediaPathsKey, SerializePaths(lastPaths));
+        Preferences.Default.Set(RecentPathsKey, SerializePaths(recentPaths));
+    }
+
     public async Task AddRecentPathsAsync(IEnumerable<string> paths)
     {
         var recentPaths = (await GetRecentPathsAsync()).ToList();

@@ -25,6 +25,8 @@ public static class MauiProgram
 		builder.Services.AddSingleton<MainPage>();
 		builder.Services.AddSingleton<SettingsService>();
 		builder.Services.AddSingleton<MediaLibraryService>();
+		builder.Services.AddSingleton<MediaFileRenameService>();
+		builder.Services.AddSingleton<MediaPathMigrationService>();
 		builder.Services.AddSingleton<FavoritesService>();
 		builder.Services.AddSingleton<SuperLikesService>();
 		builder.Services.AddSingleton<DislikesService>();

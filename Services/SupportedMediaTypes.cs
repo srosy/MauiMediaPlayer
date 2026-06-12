@@ -53,4 +53,43 @@ public static class SupportedMediaTypes
 
         return extension.ToLowerInvariant();
     }
+
+    public static bool IsKnownExtension(string? extension)
+    {
+        return !string.IsNullOrWhiteSpace(extension) && AllExtensions.Contains(extension);
+    }
+
+    public static bool HasCompoundExtension(string path)
+    {
+        var fileName = Path.GetFileName(path);
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+
+        return IsKnownExtension(Path.GetExtension(stem));
+    }
+
+    public static string GetCanonicalExtension(MediaKind kind, string preferredExtension)
+    {
+        if (kind == MediaKind.Gif)
+        {
+            return ".gif";
+        }
+
+        if (kind == MediaKind.Image)
+        {
+            return preferredExtension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)
+                ? ".jpg"
+                : preferredExtension.ToLowerInvariant();
+        }
+
+        if (kind == MediaKind.Video)
+        {
+            return preferredExtension.ToLowerInvariant() switch
+            {
+                ".m4v" or ".mov" => preferredExtension.ToLowerInvariant(),
+                _ => ".mp4"
+            };
+        }
+
+        return preferredExtension.ToLowerInvariant();
+    }
 }

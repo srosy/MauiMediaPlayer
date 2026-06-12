@@ -77,6 +77,27 @@ public sealed class SuperLikesService
         Changed?.Invoke();
     }
 
+    public void MigratePath(string oldPath, string newPath)
+    {
+        if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath))
+        {
+            return;
+        }
+
+        EnsureLoaded();
+        var oldNormalized = NormalizePath(oldPath);
+        var newNormalized = NormalizePath(newPath);
+
+        if (!_paths.Remove(oldNormalized))
+        {
+            return;
+        }
+
+        _paths.Add(newNormalized);
+        _ = PersistAsync();
+        Changed?.Invoke();
+    }
+
     public int CountInPlaylist(IEnumerable<string> playlistPaths)
     {
         EnsureLoaded();

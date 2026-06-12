@@ -11,19 +11,22 @@
    icon button (single button per mode for a denser layout). *@
 
 <div class="transport-bar" @onkeydown:stopPropagation="true">
-    <div class="transport-progress">
-        <span class="transport-time">@FormatTime(Playback.VideoPosition)</span>
-        <input class="transport-progress-range"
-               type="range"
-               min="0"
-               max="@Math.Max(1, ProgressMaxSeconds)"
-               step="1"
-               value="@Math.Min(ProgressMaxSeconds, Playback.VideoPosition.TotalSeconds)"
-               @onchange="SeekAsync"
-               disabled="@(!IsSeekable)"
-               aria-label="Playback progress" />
-        <span class="transport-time">@FormatTime(EffectiveDuration)</span>
-    </div>
+    @if (Playback.ShouldShowMasterTransportProgress)
+    {
+        <div class="transport-progress">
+            <span class="transport-time">@FormatTime(Playback.VideoPosition)</span>
+            <input class="transport-progress-range"
+                   type="range"
+                   min="0"
+                   max="@Math.Max(1, ProgressMaxSeconds)"
+                   step="1"
+                   value="@Math.Min(ProgressMaxSeconds, TransportProgressSeconds)"
+                   @onchange="SeekAsync"
+                   disabled="@(!IsSeekable)"
+                   aria-label="Playback progress" />
+            <span class="transport-time">@FormatTime(EffectiveDuration)</span>
+        </div>
+    }
 
     <div class="transport-row">
         <div class="transport-cluster" role="group" aria-label="Playback">
@@ -183,13 +186,19 @@
     [Parameter] public EventCallback OnExitCompact { get; set; }
 
     private bool _settingsOpen;
+    private double _transportProgressFrozenSeconds;
 
     protected override void OnInitialized()
     {
         Playback.Changed += OnStateChanged;
         Playlist.Changed += OnStateChanged;
         Fullscreen.FullscreenChanged += OnStateChanged;
+        _transportProgressFrozenSeconds = Playback.VideoPosition.TotalSeconds;
     }
+
+    private double TransportProgressSeconds => Playback.IsSlotScrubbing(0)
+        ? _transportProgressFrozenSeconds
+        : Playback.VideoPosition.TotalSeconds;
 
     private string? NowPlayingTitle => Playlist.CurrentItem?.DisplayName;
 
@@ -255,7 +264,7 @@
             return;
         }
 
-        await Playback.SeekAsync(seconds);
+        await Playback.SeekSlotAsync(0, seconds);
     }
 
     private static LoopMode NextLoop(LoopMode current) => current switch
@@ -284,6 +293,11 @@
 
     private void OnStateChanged()
     {
+        if (!Playback.IsSlotScrubbing(0))
+        {
+            _transportProgressFrozenSeconds = Playback.VideoPosition.TotalSeconds;
+        }
+
         _ = InvokeAsync(StateHasChanged);
     }
 

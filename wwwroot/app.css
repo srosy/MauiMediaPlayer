@@ -928,30 +928,54 @@ h1:focus {
     color: #fff;
     display: flex;
     flex: 1;
+    flex-direction: column;
+    isolation: isolate;
     justify-content: center;
     min-height: 0;
     overflow: hidden;
     position: relative;
 }
 
+.media-viewport > .media-split {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    width: 100%;
+}
+
+/* Paused video panes hide native MediaElement; never flash stale holdover stills. */
+.media-viewport.is-playback-paused .media-pane.is-video-pane .media-pane-zoom-layer .media-image-holdover,
+.media-viewport.is-playback-paused .media-pane.is-video-pane .media-image-holdover {
+    display: none;
+}
+
+.native-video-placeholder--paused {
+    background: #000;
+}
+
 .media-pause-overlay {
     align-items: center;
     background: rgba(0, 0, 0, 0.28);
     border: 0;
-    cursor: pointer;
     display: flex;
     inset: 0;
     justify-content: center;
+    /* Sibling of .media-split (not a grid item) so z-index reliably stacks above
+       all panes in single/bi/tri split. Pass clicks through to pane captions/seek
+       bars underneath; the play icon re-enables pointer events for resume. */
+    pointer-events: none;
     position: absolute;
-    z-index: 6;
+    z-index: 10;
 }
 
 .media-pause-overlay-icon {
     align-items: center;
     color: rgba(255, 255, 255, 0.72);
+    cursor: pointer;
     display: flex;
     filter: drop-shadow(0 2px 12px rgba(0, 0, 0, 0.45));
     justify-content: center;
+    pointer-events: auto;
     transition: color 0.15s ease, transform 0.15s ease;
 }
 
@@ -1083,22 +1107,128 @@ h1:focus {
     min-width: 0;
     overflow: hidden;
     position: relative;
+    z-index: 1;
 }
 
 .media-caption {
-    align-items: center;
+    align-items: stretch;
     background: linear-gradient(0deg, rgba(0, 0, 0, 0.75) 0%, rgba(0, 0, 0, 0) 100%);
     bottom: 0;
     color: #fff;
     display: flex;
-    gap: 0.625rem;
-    justify-content: space-between;
+    flex-direction: column;
+    gap: 0.375rem;
+    justify-content: flex-end;
     left: 0;
     min-height: 2.75rem;
     padding: 1.5rem 0.75rem 0.5rem;
     position: absolute;
     right: 0;
     z-index: 3;
+}
+
+.media-caption-row {
+    align-items: center;
+    display: flex;
+    gap: 0.625rem;
+    justify-content: space-between;
+    min-width: 0;
+}
+
+.media-pane-seek {
+    align-items: center;
+    display: flex;
+    gap: 0.5rem;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-med);
+    width: 100%;
+}
+
+.media-pane.is-seek-reveal .media-pane-seek,
+.media-pane-seek:focus-within,
+.media-pane-seek.is-scrubbing {
+    cursor: pointer;
+    opacity: 0.85;
+    pointer-events: auto;
+}
+
+.media-pane-seek:has(.media-pane-seek-range:disabled) {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.media-pane-seek-time {
+    color: rgba(255, 255, 255, 0.55);
+    flex-shrink: 0;
+    font-size: 0.65rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 2.25rem;
+}
+
+.media-pane-seek-time:last-child {
+    text-align: right;
+}
+
+.media-pane-seek-range {
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+    flex: 1;
+    height: 4px;
+    margin: 0;
+    min-width: 0;
+    padding: 0;
+}
+
+.media-pane-seek-range:disabled {
+    cursor: not-allowed;
+}
+
+.media-pane-seek-range::-webkit-slider-runnable-track {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 999px;
+    height: 4px;
+}
+
+.media-pane-seek-range::-webkit-slider-thumb {
+    appearance: none;
+    background: rgba(255, 255, 255, 0.55);
+    border: 0;
+    border-radius: 50%;
+    height: 12px;
+    margin-top: -4px;
+    width: 12px;
+}
+
+.media-pane-seek.is-scrubbing .media-pane-seek-range::-webkit-slider-thumb {
+    background: rgba(255, 255, 255, 0.85);
+}
+
+.media-pane-seek-range::-moz-range-track {
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 999px;
+    height: 4px;
+}
+
+.media-pane-seek-range::-moz-range-thumb {
+    background: rgba(255, 255, 255, 0.55);
+    border: 0;
+    border-radius: 50%;
+    height: 12px;
+    width: 12px;
+}
+
+.media-pane-seek.is-scrubbing .media-pane-seek-range::-moz-range-thumb {
+    background: rgba(255, 255, 255, 0.85);
+}
+
+.media-pane-seek-range:disabled::-webkit-slider-thumb {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+.media-pane-seek-range:disabled::-moz-range-thumb {
+    background: rgba(255, 255, 255, 0.25);
 }
 
 .media-caption-title {
@@ -1359,7 +1489,7 @@ h1:focus {
    Always painted (not just on hover) but heavily muted so they don't compete
    with the media; hover bumps the opacity to ~0.85. pointer-events: none keeps
    them out of the pause overlay / drag handlers. z-index sits between the zoom
-   layer (0) and the caption (3), below the pause overlay (6) and drag ghost (1000). */
+   layer (0) and the caption (3), below the pause overlay (10) and drag ghost (1000). */
 .media-pane-status {
     align-items: center;
     display: flex;

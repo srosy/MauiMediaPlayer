@@ -17,6 +17,22 @@ public sealed class VideoMetadataService(DebugLogService debugLog)
         return _cache.TryGetValue(filePath, out duration) && duration > TimeSpan.Zero;
     }
 
+    public void MigratePath(string oldPath, string newPath)
+    {
+        if (string.IsNullOrWhiteSpace(oldPath) || string.IsNullOrWhiteSpace(newPath))
+        {
+            return;
+        }
+
+        EnsureCacheLoaded();
+
+        if (_cache.TryRemove(oldPath, out var duration))
+        {
+            _cache[newPath] = duration;
+            _ = PersistCacheAsync();
+        }
+    }
+
     public async Task<TimeSpan?> ProbeDurationAsync(string filePath, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(filePath))

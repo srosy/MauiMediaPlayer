@@ -18,16 +18,17 @@ public sealed record MediaItem(
 
     public bool IsTimedVisual => Kind is MediaKind.Image or MediaKind.Gif;
 
-    public static MediaItem FromFile(string filePath, MediaKind kind, string? sourceFolder = null)
+    public static MediaItem FromFile(string filePath, MediaKind kind, string? sourceFolder = null, string? detectedExtension = null)
     {
         var fileInfo = new FileInfo(filePath);
+        var extension = detectedExtension ?? SupportedMediaTypes.GetFinalExtension(filePath);
 
         return new MediaItem(
             Guid.NewGuid(),
             fileInfo.FullName,
             Path.GetFileName(filePath),
             kind,
-            SupportedMediaTypes.GetFinalExtension(filePath),
+            extension,
             sourceFolder,
             fileInfo.Exists ? fileInfo.LastWriteTimeUtc : DateTimeOffset.MinValue,
             fileInfo.Exists ? fileInfo.Length : 0);

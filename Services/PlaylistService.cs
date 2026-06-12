@@ -70,6 +70,30 @@ public sealed class PlaylistService
         NotifyChanged();
     }
 
+    public bool UpdateFilePath(string oldPath, string newPath)
+    {
+        var index = _items.FindIndex(candidate => string.Equals(candidate.FilePath, oldPath, StringComparison.OrdinalIgnoreCase));
+
+        if (index == -1)
+        {
+            return false;
+        }
+
+        var existing = _items[index];
+        var fileInfo = new FileInfo(newPath);
+        _items[index] = existing with
+        {
+            FilePath = fileInfo.FullName,
+            DisplayName = Path.GetFileName(newPath),
+            Extension = SupportedMediaTypes.GetFinalExtension(newPath),
+            LastModified = fileInfo.Exists ? fileInfo.LastWriteTimeUtc : existing.LastModified,
+            SizeBytes = fileInfo.Exists ? fileInfo.Length : existing.SizeBytes
+        };
+
+        NotifyChanged();
+        return true;
+    }
+
     public void Remove(MediaItem item)
     {
         var index = _items.FindIndex(candidate => candidate.Id == item.Id);

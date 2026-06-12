@@ -10,11 +10,34 @@
 
 ## Features
 
+### Playback and layout
+
 - Playlist with shuffle, loop modes, and per-layout playback
 - Single, bi-split, and tri-split layouts with optional “always show a video” rules
+- Drag a pane to swap slots with another (mouse or touch); paused/playing state is preserved across the swap
 - Native video layer with smooth transitions, prefetch, and image holdover between items
+- Per-pane seek bars on every visible video pane
+- Master transport seek bar appears only when exactly one video is visible **and** it is in slot 0; with two or more videos, or a sole video in a side pane, use the per-pane seek bars instead
+- Per-pane favorite, super-like, dislike, and lock controls
+
+### Library and ratings
+
+- Favorites, dislikes, and super-likes persisted locally (`AppData`); playlist filters for All, Favorites, Dislikes, or Super-likes
+- Add media via file/folder picker or pasted paths; **Windows** also accepts OS-level drag-and-drop onto the app window (full paths via WinUI)
+- On startup, restores the last saved media location and resume position when available
+- Settings persisted locally (playback speed, image duration, volume, layout, recursive folder scan, and more)
+
+### Irregular filenames
+
+Some downloads use wrong or compound extensions (for example `.jpg` on a video). During scan the app sniffs file content—magic bytes first, then TagLib and ImageSharp fallbacks—and loads media by detected type either way.
+
+- **Manual add** (Add Media dialog, or Windows file drop): if newly added files look irregular, a batch rename modal lets you keep names or rename selected files on disk before playback continues
+- **Startup auto-load**: sniffs silently and loads with detected types; no rename modal
+- **Rename on disk**: updates stored paths in the playlist, favorites, dislikes, super-likes, per-video metadata, and saved settings
+
+### UI
+
 - Dark-first UI with transport controls, toasts, settings popover, and keyboard shortcut help (where supported)
-- Settings persisted locally (playback speed, image duration, volume, layout, and more)
 
 ## Requirements
 
@@ -68,8 +91,8 @@ dotnet publish MauiMediaPlayer.csproj -f net10.0-android36.0 -c Release -p:Andro
 
 | Platform | Notes |
 | --- | --- |
-| **Windows** | Folder picker, fullscreen helpers, and “reveal in file manager” use WinUI implementations under `Platforms/Windows`. |
-| **Android / other** | Folder picking and some desktop-only integrations use no-op or limited implementations; use **Add files** / the system picker. Drag-and-drop is oriented toward desktop. |
+| **Windows** | Folder picker, fullscreen helpers, “reveal in file manager”, and OS-level file drop (full paths) use WinUI under `Platforms/Windows`. Dropping onto the Blazor viewport alone does not expose paths—drop on the window chrome or use **Add Media**. |
+| **Android / other** | Folder picking and some desktop-only integrations use no-op or limited implementations; use **Add files** / the system picker. File drop is Windows-only today. |
 | **iOS / Mac Catalyst** | Included in the project file when building on macOS; not validated in this repo’s default CI (Windows build only). |
 
 ## Configuration

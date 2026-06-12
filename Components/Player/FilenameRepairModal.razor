@@ -1,0 +1,210 @@
+@inject MediaFileRenameService RenameService
+@inject MediaPathMigrationService PathMigration
+@inject PlaybackService Playback
+@inject DebugLogService DebugLog
+@inject ToastService Toasts
+
+@if (IsOpen)
+{
+    <div class="modal-backdrop show"></div>
+    <div class="modal d-block" tabindex="-1" role="dialog" aria-modal="true"
+         @onkeydown:stopPropagation="true">
+        <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 class="modal-title h5 d-flex align-items-center gap-2">
+                        <Icon Name="file-earmark" Size="16" />
+                        Fix irregular filenames
+                    </h2>
+                    <button class="btn-close" type="button" aria-label="Close" @onclick="KeepNamesAsync" disabled="@_isRenaming"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-body-secondary small mb-3">
+                        Some files have misleading extensions. They are already loaded using the detected format.
+                        You can rename them on disk to match their content, or keep the current names.
+                    </p>
+
+                    <div class="table-responsive filename-repair-table">
+                        <table class="table table-sm table-hover align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th scope="col" style="width: 2.5rem;">
+                                        <input class="form-check-input"
+                                               type="checkbox"
+                                               checked="@_allSelected"
+                                               @onchange="ToggleSelectAll"
+                                               disabled="@_isRenaming"
+                                               aria-label="Select all files" />
+                                    </th>
+                                    <th scope="col">Current</th>
+                                    <th scope="col">Detected</th>
+                                    <th scope="col">Proposed</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var file in _files)
+                                {
+                                    <tr>
+                                        <td>
+                                            <input class="form-check-input"
+                                                   type="checkbox"
+                                                   checked="@file.IsSelected"
+                                                   @onchange="args => ToggleFile(file, args)"
+                                                   disabled="@_isRenaming"
+                                                   aria-label="@($"Select {file.DisplayName}")" />
+                                        </td>
+                                        <td class="text-truncate" style="max-width: 14rem;" title="@file.DisplayName">@file.DisplayName</td>
+                                        <td>@file.DetectedKind @file.DetectedExtension</td>
+                                        <td class="text-truncate" style="max-width: 14rem;" title="@file.SuggestedFileName">@file.SuggestedFileName</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-outline-secondary" type="button" @onclick="KeepNamesAsync" disabled="@_isRenaming">Keep names</button>
+                    <button class="btn btn-primary" type="button" @onclick="RenameSelectedAsync" disabled="@(_isRenaming || !HasSelectedFiles)">
+                        @(_isRenaming ? $"Renaming {_renameProgress} / {_renameTotal}..." : "Rename selected")
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool IsOpen { get; set; }
+    [Parameter] public EventCallback<bool> IsOpenChanged { get; set; }
+    [Parameter] public IReadOnlyList<IrregularMediaFile> IrregularFiles { get; set; } = [];
+    [Parameter] public EventCallback OnCompleted { get; set; }
+
+    private readonly List<RepairRow> _files = [];
+    private bool _allSelected = true;
+    private bool _isRenaming;
+    private int _renameProgress;
+    private int _renameTotal;
+
+    private bool HasSelectedFiles => _files.Any(static file => file.IsSelected);
+
+    protected override void OnParametersSet()
+    {
+        if (!IsOpen)
+        {
+            return;
+        }
+
+        _files.Clear();
+
+        foreach (var file in IrregularFiles)
+        {
+            _files.Add(new RepairRow(file, isSelected: true));
+        }
+
+        _allSelected = _files.Count > 0;
+    }
+
+    private void ToggleSelectAll(ChangeEventArgs args)
+    {
+        var selected = args.Value is bool enabled && enabled;
+        _allSelected = selected;
+
+        foreach (var file in _files)
+        {
+            file.IsSelected = selected;
+        }
+    }
+
+    private void ToggleFile(RepairRow file, ChangeEventArgs args)
+    {
+        file.IsSelected = args.Value is bool enabled && enabled;
+        _allSelected = _files.Count > 0 && _files.All(static row => row.IsSelected);
+    }
+
+    private async Task KeepNamesAsync()
+    {
+        if (_isRenaming)
+        {
+            return;
+        }
+
+        await CloseAsync();
+    }
+
+    private async Task RenameSelectedAsync()
+    {
+        if (_isRenaming)
+        {
+            return;
+        }
+
+        var selected = _files.Where(static file => file.IsSelected).ToArray();
+
+        if (selected.Length == 0)
+        {
+            await KeepNamesAsync();
+            return;
+        }
+
+        _isRenaming = true;
+        _renameProgress = 0;
+        _renameTotal = selected.Length;
+        var renamedCount = 0;
+
+        try
+        {
+            foreach (var file in selected)
+            {
+                _renameProgress++;
+                var result = await RenameService.TryRenameAsync(file.FilePath, file.SuggestedFileName);
+
+                if (!result.Success)
+                {
+                    Toasts.Error($"Could not rename {file.DisplayName}: {result.ErrorMessage}");
+                    continue;
+                }
+
+                if (result.Renamed)
+                {
+                    await PathMigration.MigrateAllAsync(result.SourcePath, result.TargetPath);
+                    file.FilePath = result.TargetPath;
+                    file.DisplayName = Path.GetFileName(result.TargetPath);
+                    renamedCount++;
+                }
+            }
+
+            if (renamedCount > 0)
+            {
+                DebugLog.Add($"FilenameRepair: renamed {renamedCount} file(s) on disk.");
+                Toasts.Success($"Renamed {renamedCount} file{(renamedCount == 1 ? "" : "s")}.");
+
+                if (Playback.Status != PlaybackStatus.Stopped)
+                {
+                    await Playback.RefreshPlaylistAsync();
+                }
+            }
+        }
+        finally
+        {
+            _isRenaming = false;
+            await CloseAsync();
+        }
+    }
+
+    private async Task CloseAsync()
+    {
+        IsOpen = false;
+        await IsOpenChanged.InvokeAsync(IsOpen);
+        await OnCompleted.InvokeAsync();
+    }
+
+    private sealed class RepairRow(IrregularMediaFile source, bool isSelected)
+    {
+        public string FilePath { get; set; } = source.FilePath;
+        public string DisplayName { get; set; } = source.DisplayName;
+        public string DetectedExtension { get; } = source.DetectedExtension;
+        public MediaKind DetectedKind { get; } = source.DetectedKind;
+        public string SuggestedFileName { get; } = source.SuggestedFileName;
+        public bool IsSelected { get; set; } = isSelected;
+    }
+}

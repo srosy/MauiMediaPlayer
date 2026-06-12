@@ -16,7 +16,7 @@
     var visiblePanes = VisiblePanes;
 }
 
-<div class="media-viewport media-split media-split-@visiblePanes.Count @(_isDragOver ? "is-drag-over" : null)"
+<div class="media-viewport @(Playback.Status == PlaybackStatus.Paused ? "is-playback-paused" : null) @(_isDragOver ? "is-drag-over" : null)"
      @ondragenter="OnDragEnter"
      @ondragover:preventDefault="true"
      @ondragleave="OnDragLeave"
@@ -46,6 +46,7 @@
     }
     else
     {
+        <div class="media-split media-split-@visiblePanes.Count">
         @foreach (var pane in visiblePanes)
         {
             @* `is-video-pane` toggles a CSS rule that clips holdover/placeholder
@@ -70,7 +71,7 @@
                     @if (Dislikes.IsDisliked(pane.Item.FilePath))
                     {
                         <span class="media-pane-status-icon media-pane-status-dislike" title="Disliked">
-                            <Icon Name="heartbreak-fill" Size="36" />
+                            <Icon Name="slash-circle-fill" Size="36" />
                         </span>
                     }
                     @if (Playback.IsSlotLocked(pane.SlotIndex))
@@ -84,6 +85,17 @@
                      @onpointerdown="e => OnPanePointerDownAsync(pane.SlotIndex, e)">
                 @if (pane.Item.Kind == MediaKind.Video)
                 {
+                    @* While paused the native MediaElement is hidden so the HTML pause
+                       overlay can paint above video panes. Never show the image holdover
+                       here — it is often stale (image→video or post drag-swap) and reads
+                       as the wrong pane's content. A black underlay is less jarring than
+                       an unrelated still. *@
+                    if (Playback.Status == PlaybackStatus.Paused)
+                    {
+                        <div class="native-video-placeholder native-video-placeholder--paused"></div>
+                    }
+                    else
+                    {
                     @* Phase 5: extend the Phase 4 hold-over treatment to video panes. The
                        native MediaElement is hidden via reveal-on-Playing (Phase 1) for
                        ~0.5-1s while the platform opens the new source. Without a hold-over
@@ -125,6 +137,7 @@
                            than a stale image flash or placeholder text. The MediaElement
                            reveals on top within ~1s. *@
                         <div class="native-video-placeholder @(!prevWasVideo ? "native-video-placeholder--spinner" : null)"></div>
+                    }
                     }
                 }
                 else if (pane.Item.Kind is MediaKind.Image or MediaKind.Gif)
@@ -175,6 +188,11 @@
                 </div>
 
                 <div class="media-caption">
+                    @if (pane.Item.Kind == MediaKind.Video)
+                    {
+                        <PaneVideoSeekBar @key="@($"{pane.SlotIndex}:{pane.Item.Id}")" SlotIndex="pane.SlotIndex" />
+                    }
+                    <div class="media-caption-row">
                     <span class="media-caption-title">@pane.Item.DisplayName</span>
                     <span class="media-caption-actions">
                         <button class="media-superlike-btn @(SuperLikes.IsSuperLiked(pane.Item.FilePath) ? "is-superliked" : null)"
@@ -200,9 +218,9 @@
                                 title="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "Remove dislike" : "Dislike")"
                                 aria-label="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "Remove dislike" : "Dislike")"
                                 aria-pressed="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "true" : "false")"
-                                @onclick="() => ToggleDislikeAsync(pane.Item)"
+                                @onclick="() => ToggleDislikeAsync(pane.SlotIndex, pane.Item)"
                                 @onclick:stopPropagation="true">
-                            <Icon Name="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "heartbreak-fill" : "heartbreak")" Size="18" />
+                            <Icon Name="@(Dislikes.IsDisliked(pane.Item.FilePath) ? "slash-circle-fill" : "slash-circle")" Size="18" />
                         </button>
                         <button class="media-lock-btn @(Playback.IsSlotLocked(pane.SlotIndex) ? "is-locked" : null)"
                                 type="button"
@@ -233,9 +251,11 @@
                         </button>
                         <span class="media-caption-kind">@pane.Item.Kind</span>
                     </span>
+                    </div>
                 </div>
             </div>
         }
+        </div>
 
         @if (Playback.Status == PlaybackStatus.Paused)
         {
@@ -259,6 +279,7 @@
     private const int MaxPanes = 3;
     private const double PaneDragThresholdPx = 8;
     private const double PaneDragGhostOffsetPx = 18;
+    private const int PaneSeekRevealIdleMs = 2500;
     private readonly Dictionary<Guid, string> _imageSources = [];
     private readonly Dictionary<Guid, string> _imageErrors = [];
     private readonly HashSet<Guid> _loadingImageIds = [];
@@ -338,7 +359,7 @@
         await InvokeAsync(StateHasChanged);
     }
 
-    private async Task ToggleDislikeAsync(MediaItem item)
+    private async Task ToggleDislikeAsync(int slotIndex, MediaItem item)
     {
         if (Favorites.IsFavorite(item.FilePath))
         {
@@ -350,8 +371,17 @@
             SuperLikes.Remove(item.FilePath);
         }
 
-        var added = Dislikes.Toggle(item.FilePath);
-        Toasts.Info(added ? $"Disliked: {item.DisplayName}" : $"Removed dislike: {item.DisplayName}");
+        if (Dislikes.IsDisliked(item.FilePath))
+        {
+            Dislikes.Toggle(item.FilePath);
+            Toasts.Info($"Removed dislike: {item.DisplayName}");
+        }
+        else
+        {
+            await Playback.DislikeAndAdvanceSlotAsync(slotIndex, item.FilePath);
+            Toasts.Info($"Disliked: {item.DisplayName}");
+        }
+
         await InvokeAsync(StateHasChanged);
     }
 
@@ -837,6 +867,7 @@
             try
             {
                 await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneZoom");
+                await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneSeekReveal", PaneSeekRevealIdleMs);
             }
             catch (JSDisconnectedException)
             {
@@ -853,6 +884,7 @@
             {
                 await JS.InvokeVoidAsync("mauiMediaPlayer.ensureMediaPaneObservers");
                 await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneZoom");
+                await JS.InvokeVoidAsync("mauiMediaPlayer.installPaneSeekReveal", PaneSeekRevealIdleMs);
             }
             catch (JSDisconnectedException)
             {
@@ -863,6 +895,11 @@
         UpdateHoldoverState();
         PruneImageCache();
         await WatchImageElementsAsync();
+
+        if (firstRender && Playback.Status == PlaybackStatus.Paused && VisiblePanes.Count > 0)
+        {
+            await SyncPauseOverlayNativeSuppressionAsync();
+        }
     }
 
     private void OnFullscreenChanged()
@@ -994,6 +1031,8 @@
             _pauseOverlayShowPauseIcon = false;
         }
 
+        _ = SyncPauseOverlayNativeSuppressionAsync();
+
         if (_paneDragUsesJsSession)
         {
             _paneDragDeferredRefresh = true;
@@ -1028,8 +1067,24 @@
         }
     }
 
+    private Task SyncPauseOverlayNativeSuppressionAsync()
+    {
+        if (Playback.Status != PlaybackStatus.Paused || VisiblePanes.Count == 0)
+        {
+            return NativeVideo.ClearPauseOverlaySuppressionAsync();
+        }
+
+        var videoSlotIndices = VisiblePanes
+            .Where(static pane => pane.Item.Kind == MediaKind.Video)
+            .Select(static pane => pane.SlotIndex)
+            .ToArray();
+
+        return NativeVideo.SuppressForPauseOverlayAsync(suppress: true, videoSlotIndices);
+    }
+
     private async Task RefreshAfterPlaybackChangedAsync()
     {
+        await SyncPauseOverlayNativeSuppressionAsync();
         await InvalidatePaneZoomAsync();
 
         try
@@ -1401,6 +1456,7 @@
         _nativePaneDragSlot = -1;
 
         await NativeVideo.ClearPaneSwapSuppressionAsync();
+        await NativeVideo.ClearPauseOverlaySuppressionAsync();
 
         _dotNetReference?.Dispose();
     }

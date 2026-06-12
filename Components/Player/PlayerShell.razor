@@ -129,6 +129,10 @@
        the native MediaElements. *@
     <KeyboardShortcutsModal IsOpen="_shortcutsOpen" IsOpenChanged="OnShortcutsOpenChanged" />
     <AboutModal IsOpen="_aboutOpen" IsOpenChanged="OnAboutOpenChanged" />
+    <FilenameRepairModal IsOpen="_filenameRepairOpen"
+                         IsOpenChanged="OnFilenameRepairOpenChanged"
+                         IrregularFiles="_pendingIrregularFiles"
+                         OnCompleted="OnFilenameRepairCompletedAsync" />
 
     @if (_showAddMediaDialog)
     {
@@ -218,6 +222,9 @@
     private bool _overflowOpen;
     private bool _shortcutsOpen;
     private bool _aboutOpen;
+    private bool _filenameRepairOpen;
+    private bool _deferPlaybackAfterModal;
+    private IReadOnlyList<IrregularMediaFile> _pendingIrregularFiles = [];
     private bool _playlistCollapsed;
     private bool _compactMode;
     private string _theme = "dark";
@@ -431,7 +438,7 @@
             DebugLog.Add($"Loading {paths.Length} path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
             _lastLibraryFolder = ResolveLibraryRoot(paths);
             var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
-            var loadedAny = await AddScanResultAsync(result, "media");
+            var loadedAny = await AddScanResultAsync(result, "media", isManualFlow: true);
 
             if (loadedAny)
             {
@@ -453,10 +460,13 @@
         }
     }
 
-    private async Task<bool> AddScanResultAsync(MediaScanResult result, string sourceDescription)
+    private async Task<bool> AddScanResultAsync(MediaScanResult result, string sourceDescription, bool isManualFlow)
     {
         if (result.Items.Count > 0)
         {
+            var existingPaths = Playlist.Items
+                .Select(static item => item.FilePath)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             Playlist.AddItems(result.Items);
 
             if (_lastLibraryFolder is not null)
@@ -471,17 +481,28 @@
             }
 
             var skipped = result.SkippedFiles.Count;
+            var irregular = result.IrregularFiles.Count;
+            var newlyAddedIrregular = result.IrregularFiles
+                .Where(file => !existingPaths.Contains(file.FilePath))
+                .ToArray();
             var skipPart = skipped > 0 ? $" (skipped {skipped} unsupported)" : "";
-            Toasts.Success($"Added {result.Items.Count} item{(result.Items.Count == 1 ? "" : "s")} from {sourceDescription}{skipPart}.");
-            DebugLog.Add($"Added {result.Items.Count} item(s); skipped {skipped}.");
+            var irregularPart = irregular > 0 ? $" ({irregular} irregular)" : "";
+            Toasts.Success($"Added {result.Items.Count} item{(result.Items.Count == 1 ? "" : "s")} from {sourceDescription}{skipPart}{irregularPart}.");
+            DebugLog.Add($"Added {result.Items.Count} item(s); skipped {skipped}; irregular {irregular}; new irregular {newlyAddedIrregular.Length}.");
 
-            if (Playback.Status == PlaybackStatus.Stopped)
+            var shouldDeferPlayback = isManualFlow && newlyAddedIrregular.Length > 0;
+
+            if (shouldDeferPlayback)
             {
-                await Playback.PlayAsync();
+                _pendingIrregularFiles = newlyAddedIrregular;
+                _deferPlaybackAfterModal = true;
+                _filenameRepairOpen = true;
+                await SyncOverlaySuppressionAsync();
+                await InvokeAsync(StateHasChanged);
             }
             else
             {
-                await Playback.RefreshPlaylistAsync();
+                await StartPlaybackAfterScanAsync();
             }
 
             return true;
@@ -527,7 +548,7 @@
             DebugLog.Add($"Auto-loading {paths.Length} saved media path(s). Recursive folder scan: {Playback.Settings.RecursiveFolderScan}.");
             _lastLibraryFolder = ResolveLibraryRoot(paths);
             var result = await Task.Run(() => MediaLibrary.LoadFromPaths(paths, Playback.Settings.RecursiveFolderScan));
-            await AddScanResultAsync(result, "last known location");
+            await AddScanResultAsync(result, "last known location", isManualFlow: false);
         }
         catch (Exception exception)
         {
@@ -619,6 +640,7 @@
     {
         var anyOverlayOpen = _shortcutsOpen
             || _aboutOpen
+            || _filenameRepairOpen
             || _showAddMediaDialog
             || Popovers.AnySuppressesNativeVideo;
         return NativeVideo.SuppressForOverlayAsync(anyOverlayOpen);
@@ -634,6 +656,45 @@
     {
         _aboutOpen = isOpen;
         await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task OnFilenameRepairOpenChanged(bool isOpen)
+    {
+        _filenameRepairOpen = isOpen;
+
+        if (!isOpen)
+        {
+            _pendingIrregularFiles = [];
+        }
+
+        await SyncOverlaySuppressionAsync();
+    }
+
+    private async Task OnFilenameRepairCompletedAsync()
+    {
+        _filenameRepairOpen = false;
+        _pendingIrregularFiles = [];
+        await SyncOverlaySuppressionAsync();
+
+        if (_deferPlaybackAfterModal)
+        {
+            _deferPlaybackAfterModal = false;
+            await StartPlaybackAfterScanAsync();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task StartPlaybackAfterScanAsync()
+    {
+        if (Playback.Status == PlaybackStatus.Stopped)
+        {
+            await Playback.PlayAsync();
+        }
+        else
+        {
+            await Playback.RefreshPlaylistAsync();
+        }
     }
 
     private async Task ToggleThemeAsync()
@@ -718,6 +779,7 @@
                 }
                 if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); break; }
                 if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); break; }
+                if (_filenameRepairOpen) { await OnFilenameRepairCompletedAsync(); break; }
                 if (_showAddMediaDialog) { await CloseAddMediaDialog(); break; }
                 Popovers.CloseAll();
                 await SyncOverlaySuppressionAsync();
@@ -764,6 +826,7 @@
                 }
                 if (_shortcutsOpen) { _shortcutsOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
                 if (_aboutOpen) { _aboutOpen = false; await SyncOverlaySuppressionAsync(); await InvokeAsync(StateHasChanged); break; }
+                if (_filenameRepairOpen) { await OnFilenameRepairCompletedAsync(); await InvokeAsync(StateHasChanged); break; }
                 if (_showAddMediaDialog) { await CloseAddMediaDialog(); await InvokeAsync(StateHasChanged); break; }
                 Popovers.CloseAll();
                 await SyncOverlaySuppressionAsync();

@@ -72,6 +72,7 @@ public sealed class MediaLibraryService(IFolderPickerService folderPickerService
     {
         var items = new List<MediaItem>();
         var skippedFiles = new List<SkippedMediaFile>();
+        var irregularFiles = new List<IrregularMediaFile>();
         var distinctPaths = paths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
         debugLog.Info($"Scanning {distinctPaths.Length} path(s); recursive={recursive}.");
@@ -81,25 +82,25 @@ public sealed class MediaLibraryService(IFolderPickerService folderPickerService
             if (File.Exists(path))
             {
                 debugLog.Trace($"Scanning file: {path}");
-                AddFile(path, sourceFolder: null, items, skippedFiles);
+                AddFile(path, sourceFolder: null, items, skippedFiles, irregularFiles);
                 continue;
             }
 
             if (Directory.Exists(path))
             {
                 debugLog.Trace($"Scanning folder: {path}");
-                AddFolder(path, recursive, items, skippedFiles);
+                AddFolder(path, recursive, items, skippedFiles, irregularFiles);
                 continue;
             }
 
             skippedFiles.Add(new SkippedMediaFile(path, "File or folder was not found."));
         }
 
-        debugLog.Info($"Scan complete. Loaded={items.Count}; skipped={skippedFiles.Count}.");
-        return new MediaScanResult(items, skippedFiles);
+        debugLog.Info($"Scan complete. Loaded={items.Count}; skipped={skippedFiles.Count}; irregular={irregularFiles.Count}.");
+        return new MediaScanResult(items, skippedFiles, irregularFiles);
     }
 
-    private static void AddFolder(string folderPath, bool recursive, List<MediaItem> items, List<SkippedMediaFile> skippedFiles)
+    private void AddFolder(string folderPath, bool recursive, List<MediaItem> items, List<SkippedMediaFile> skippedFiles, List<IrregularMediaFile> irregularFiles)
     {
         try
         {
@@ -111,7 +112,7 @@ public sealed class MediaLibraryService(IFolderPickerService folderPickerService
 
             foreach (var filePath in Directory.EnumerateFiles(folderPath, "*", options))
             {
-                TryAddFile(filePath, folderPath, items, skippedFiles);
+                TryAddFile(filePath, folderPath, items, skippedFiles, irregularFiles);
             }
         }
         catch (UnauthorizedAccessException)
@@ -124,24 +125,53 @@ public sealed class MediaLibraryService(IFolderPickerService folderPickerService
         }
     }
 
-    private static void AddFile(string filePath, string? sourceFolder, List<MediaItem> items, List<SkippedMediaFile> skippedFiles)
+    private void AddFile(string filePath, string? sourceFolder, List<MediaItem> items, List<SkippedMediaFile> skippedFiles, List<IrregularMediaFile> irregularFiles)
     {
-        TryAddFile(filePath, sourceFolder, items, skippedFiles);
+        TryAddFile(filePath, sourceFolder, items, skippedFiles, irregularFiles);
     }
 
-    private static void TryAddFile(string filePath, string? sourceFolder, List<MediaItem> items, List<SkippedMediaFile> skippedFiles)
+    private void TryAddFile(
+        string filePath,
+        string? sourceFolder,
+        List<MediaItem> items,
+        List<SkippedMediaFile> skippedFiles,
+        List<IrregularMediaFile> irregularFiles)
     {
-        var kind = SupportedMediaTypes.GetKind(filePath);
+        var declaredKind = SupportedMediaTypes.GetKind(filePath);
+        var declaredExtension = SupportedMediaTypes.GetFinalExtension(filePath);
+        var hasCompoundExtension = SupportedMediaTypes.HasCompoundExtension(filePath);
+        MediaKind effectiveKind;
+        string effectiveExtension;
+        MediaSniffResult sniffResult;
 
-        if (kind == MediaKind.Unknown)
+        if (declaredKind != MediaKind.Unknown && !hasCompoundExtension)
+        {
+            debugLog.Trace($"FilenameRepair: TRACE sniff skipped fast-path for {Path.GetFileName(filePath)}.");
+            effectiveKind = declaredKind;
+            effectiveExtension = SupportedMediaTypes.GetCanonicalExtension(declaredKind, declaredExtension);
+            sniffResult = new MediaSniffResult(declaredKind, effectiveExtension);
+        }
+        else if (!MediaFormatSniffer.TrySniff(filePath, debugLog, out var sniffed) || sniffed is null)
         {
             skippedFiles.Add(new SkippedMediaFile(filePath, "Unsupported file extension."));
             return;
         }
+        else
+        {
+            sniffResult = sniffed;
+            effectiveKind = sniffResult.Kind;
+            effectiveExtension = SupportedMediaTypes.GetCanonicalExtension(sniffResult.Kind, sniffResult.Extension);
+        }
 
         try
         {
-            items.Add(MediaItem.FromFile(filePath, kind, sourceFolder));
+            items.Add(MediaItem.FromFile(filePath, effectiveKind, sourceFolder, effectiveExtension));
+
+            if (IrregularFilenameAnalyzer.TryAnalyze(filePath, declaredKind, declaredExtension, sniffResult, out var irregularFile))
+            {
+                debugLog.Debug($"FilenameRepair: DEBUG flagged irregular file {irregularFile.DisplayName}; reason={irregularFile.Reason}; suggested={irregularFile.SuggestedFileName}.");
+                irregularFiles.Add(irregularFile);
+            }
         }
         catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException or IOException)
         {

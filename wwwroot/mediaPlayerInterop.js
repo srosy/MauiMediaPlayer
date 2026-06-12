@@ -403,6 +403,152 @@ window.mauiMediaPlayer = {
         window._mauiMediaPlayerPaneZoom = null;
     },
 
+    // Per-pane seek bar: hidden until pointer moves over that pane, then fades after
+    // idleMs with no movement. Scrubbing keeps the bar visible until release.
+    installPaneSeekReveal(idleMs) {
+        const limit = Math.max(500, Number(idleMs) || 2500);
+
+        let state = window._mauiMediaPlayerPaneSeekReveal;
+        if (!state) {
+            const isScrubbing = (pane) =>
+                !!pane.querySelector('.media-pane-seek.is-scrubbing');
+
+            const hasSeekBar = (pane) =>
+                pane.classList.contains('is-video-pane')
+                && !!pane.querySelector('.media-pane-seek');
+
+            const scheduleHide = (pane) => {
+                if (pane._mauiSeekRevealTimer) {
+                    clearTimeout(pane._mauiSeekRevealTimer);
+                }
+
+                pane._mauiSeekRevealTimer = setTimeout(() => {
+                    pane._mauiSeekRevealTimer = null;
+
+                    if (isScrubbing(pane)) {
+                        scheduleHide(pane);
+                        return;
+                    }
+
+                    pane.classList.remove('is-seek-reveal');
+                    pane._mauiSeekHideOnScrubEnd = false;
+                }, state.idleMs);
+            };
+
+            const revealSeek = (pane) => {
+                if (!hasSeekBar(pane)) {
+                    return;
+                }
+
+                pane._mauiSeekHideOnScrubEnd = false;
+                pane.classList.add('is-seek-reveal');
+                scheduleHide(pane);
+            };
+
+            const hideSeek = (pane) => {
+                if (!hasSeekBar(pane)) {
+                    return;
+                }
+
+                if (isScrubbing(pane)) {
+                    pane._mauiSeekHideOnScrubEnd = true;
+                    return;
+                }
+
+                if (pane._mauiSeekRevealTimer) {
+                    clearTimeout(pane._mauiSeekRevealTimer);
+                    pane._mauiSeekRevealTimer = null;
+                }
+
+                pane.classList.remove('is-seek-reveal');
+                pane._mauiSeekHideOnScrubEnd = false;
+            };
+
+            state = {
+                idleMs: limit,
+                moveHandler: (event) => revealSeek(event.currentTarget),
+                leaveHandler: (event) => hideSeek(event.currentTarget)
+            };
+
+            window._mauiMediaPlayerPaneSeekReveal = state;
+        } else {
+            state.idleMs = limit;
+        }
+
+        const attachToPane = (pane) => {
+            if (!pane.classList.contains('is-video-pane')) {
+                return;
+            }
+
+            const seekBar = pane.querySelector('.media-pane-seek');
+            if (!seekBar) {
+                return;
+            }
+
+            if (!pane._mauiSeekRevealMove) {
+                pane._mauiSeekRevealMove = state.moveHandler;
+                pane.addEventListener('pointermove', state.moveHandler, { passive: true });
+            }
+
+            if (!pane._mauiSeekRevealLeave) {
+                pane._mauiSeekRevealLeave = state.leaveHandler;
+                pane.addEventListener('pointerleave', state.leaveHandler, { passive: true });
+            }
+
+            if (!seekBar._mauiSeekScrubObserver) {
+                const observer = new MutationObserver(() => {
+                    if (seekBar.classList.contains('is-scrubbing')) {
+                        return;
+                    }
+
+                    if (pane._mauiSeekHideOnScrubEnd) {
+                        pane._mauiSeekHideOnScrubEnd = false;
+                        pane.classList.remove('is-seek-reveal');
+
+                        if (pane._mauiSeekRevealTimer) {
+                            clearTimeout(pane._mauiSeekRevealTimer);
+                            pane._mauiSeekRevealTimer = null;
+                        }
+                    }
+                });
+                observer.observe(seekBar, { attributes: true, attributeFilter: ['class'] });
+                seekBar._mauiSeekScrubObserver = observer;
+            }
+        };
+
+        document.querySelectorAll('[data-media-pane]').forEach(attachToPane);
+    },
+
+    disposePaneSeekReveal() {
+        document.querySelectorAll('[data-media-pane]').forEach((pane) => {
+            if (pane._mauiSeekRevealMove) {
+                pane.removeEventListener('pointermove', pane._mauiSeekRevealMove);
+                delete pane._mauiSeekRevealMove;
+            }
+
+            if (pane._mauiSeekRevealLeave) {
+                pane.removeEventListener('pointerleave', pane._mauiSeekRevealLeave);
+                delete pane._mauiSeekRevealLeave;
+            }
+
+            if (pane._mauiSeekRevealTimer) {
+                clearTimeout(pane._mauiSeekRevealTimer);
+                delete pane._mauiSeekRevealTimer;
+            }
+
+            pane.classList.remove('is-seek-reveal');
+            delete pane._mauiSeekHideOnScrubEnd;
+
+            const seekBar = pane.querySelector('.media-pane-seek');
+            if (seekBar?._mauiSeekScrubObserver) {
+                seekBar._mauiSeekScrubObserver.disconnect();
+                delete seekBar._mauiSeekScrubObserver;
+            }
+        });
+
+        window._mauiMediaPlayerPaneSeekReveal = null;
+    },
+
     _paneSwapDrag: null,
 
     _paneSwapLog(dotNetReference, level, message) {
@@ -534,6 +680,7 @@ window.mauiMediaPlayer = {
 
         const armDrag = () => {
             armed = true;
+            window.mauiMediaPlayer.invalidatePaneZoom();
             viewport.classList.add('is-pane-swap-active');
             sourcePane?.classList.add('is-pane-drag-source');
             createGhost();
@@ -931,6 +1078,7 @@ window.mauiMediaPlayer = {
     },
 
     disposeMediaViewportBoundsObserver() {
+        window.mauiMediaPlayer.disposePaneSeekReveal();
         window.mauiMediaPlayer.disposePaneZoom();
 
         if (window._mauiMediaPlayerBoundsNotifyTimer) {

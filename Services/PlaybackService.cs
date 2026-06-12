@@ -37,7 +37,12 @@ public sealed class PlaybackService(
     private readonly bool[] _slotShuffleQueueInitialized = new bool[MaxSlots];
     private readonly bool[] _slotStaggerApplied = new bool[MaxSlots];
     private readonly bool[] _slotLocked = new bool[MaxSlots];
+    private readonly TimeSpan[] _slotVideoPosition = new TimeSpan[MaxSlots];
+    private readonly TimeSpan[] _slotVideoDuration = new TimeSpan[MaxSlots];
+    private readonly bool[] _slotScrubbing = new bool[MaxSlots];
     private readonly LinkedList<int>[] _slotHistory = Enumerable.Range(0, MaxSlots)
+        .Select(_ => new LinkedList<int>()).ToArray();
+    private readonly LinkedList<int>[] _slotForward = Enumerable.Range(0, MaxSlots)
         .Select(_ => new LinkedList<int>()).ToArray();
     private const int MaxSlotHistoryDepth = 10;
     // Guards the relationship between _slotBasePlaylistIndex, _slotIndices, and
@@ -55,6 +60,9 @@ public sealed class PlaybackService(
     private bool _dislikesEmptyNotified;
     private bool _superlikesEmptyNotified;
     private bool _mediaKindsEmptyNotified;
+    // Set while a pane dislike is toggled on so OnDislikesChanged skips
+    // AlignSlotsToEligibilityLocked; SkipSlotAsync advances that slot once.
+    private int _dislikeSlotAdvanceTarget = -1;
 
     public event Action? Changed;
 
@@ -78,6 +86,22 @@ public sealed class PlaybackService(
 
     public IReadOnlyList<VisibleMediaSlot> VisiblePanes => GetVisiblePanes();
 
+    public int VisibleVideoPaneCount => VisiblePanes.Count(static pane => pane.Item.Kind == MediaKind.Video);
+
+    public bool ShouldShowMasterTransportProgress
+    {
+        get
+        {
+            if (VisibleVideoPaneCount != 1)
+            {
+                return false;
+            }
+
+            var soleVideoPane = VisiblePanes.FirstOrDefault(static pane => pane.Item.Kind == MediaKind.Video);
+            return soleVideoPane?.SlotIndex == 0;
+        }
+    }
+
     public async Task InitializeAsync()
     {
         if (_initialized)
@@ -88,6 +112,7 @@ public sealed class PlaybackService(
         Settings = await settingsService.LoadAsync();
         _initialized = true;
         nativeVideoPlayback.ProgressChanged += UpdateVideoProgress;
+        nativeVideoPlayback.SlotProgressChanged += OnSlotProgressChanged;
         nativeVideoPlayback.EndReached += OnNativeVideoEnded;
         nativeVideoPlayback.PlaybackStarted += OnNativeVideoStarted;
         // Phase 2 invalidation: catch playlist mutations (Remove of a non-current item,
@@ -154,11 +179,11 @@ public sealed class PlaybackService(
         Status = PlaybackStatus.Playing;
         debugLog.Info($"Playback started: {primaryItem?.DisplayName} ({primaryItem?.Kind}).");
         LogActiveConfiguration("playback-started");
-        NotifyChanged();
 
         await PlayVisibleSlotsAsync(forceRestartTimers: true);
         nativeVideoPlayback.RequestLayoutBoundsResync();
         await nativeVideoPlayback.ReconcilePlaybackSurfacesAsync();
+        NotifyChanged();
     }
 
     public async Task PauseAsync()
@@ -196,6 +221,7 @@ public sealed class PlaybackService(
         }
 
         StopAllSlotTimers();
+        ClearAllSlotVideoProgress();
         await nativeVideoPlayback.StopAsync();
         NotifyChanged();
     }
@@ -291,7 +317,7 @@ public sealed class PlaybackService(
             return Task.CompletedTask;
         }
 
-        if (Status != PlaybackStatus.Playing)
+        if (Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
         {
             debugLog.Trace($"Skip ignored for slot {slotIndex + 1}; status={Status}.");
             return Task.CompletedTask;
@@ -310,7 +336,76 @@ public sealed class PlaybackService(
         }
 
         debugLog.Debug($"Skip requested for slot {slotIndex + 1}.");
+
+        if (HasSlotForwardEntries(slotIndex))
+        {
+            return GoForwardSlotAsync(slotIndex);
+        }
+
         return CompleteSlotAsync(slotIndex, expectedPath: null, playbackGeneration: null, forceAdvance: true);
+    }
+
+    // Marks an item disliked and advances only the targeted pane. Bypasses the per-pane
+    // forward stack (unlike Skip) so a dislike after Go Back always steps forward in the
+    // playlist instead of restoring a skipped item.
+    public async Task DislikeAndAdvanceSlotAsync(int slotIndex, string filePath)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots || !IsActiveSlot(slotIndex))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(filePath) || dislikesService.IsDisliked(filePath))
+        {
+            return;
+        }
+
+        if (Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
+        {
+            return;
+        }
+
+        if (_slotLocked[slotIndex])
+        {
+            debugLog.Debug($"Dislike advance blocked for slot {slotIndex + 1}; slot is locked.");
+            return;
+        }
+
+        _dislikeSlotAdvanceTarget = slotIndex;
+
+        try
+        {
+            dislikesService.Toggle(filePath);
+            await CompleteSlotAsync(slotIndex, expectedPath: null, playbackGeneration: null, forceAdvance: true);
+        }
+        finally
+        {
+            _dislikeSlotAdvanceTarget = -1;
+        }
+    }
+
+    public bool IsSlotScrubbing(int slotIndex) =>
+        slotIndex >= 0 && slotIndex < MaxSlots && _slotScrubbing[slotIndex];
+
+    public TimeSpan GetSlotVideoPosition(int slotIndex) =>
+        slotIndex >= 0 && slotIndex < MaxSlots ? _slotVideoPosition[slotIndex] : TimeSpan.Zero;
+
+    public TimeSpan GetSlotVideoDuration(int slotIndex) =>
+        slotIndex >= 0 && slotIndex < MaxSlots ? _slotVideoDuration[slotIndex] : TimeSpan.Zero;
+
+    public void SetSlotScrubbing(int slotIndex, bool scrubbing)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots || _slotScrubbing[slotIndex] == scrubbing)
+        {
+            return;
+        }
+
+        _slotScrubbing[slotIndex] = scrubbing;
+
+        if (slotIndex == 0)
+        {
+            NotifyChanged();
+        }
     }
 
     public bool IsSlotLocked(int slotIndex)
@@ -371,6 +466,7 @@ public sealed class PlaybackService(
             (_slotNativeGenerations[slotA], _slotNativeGenerations[slotB]) = (
                 _slotNativeGenerations[slotB], _slotNativeGenerations[slotA]);
             (_slotHistory[slotA], _slotHistory[slotB]) = (_slotHistory[slotB], _slotHistory[slotA]);
+            (_slotForward[slotA], _slotForward[slotB]) = (_slotForward[slotB], _slotForward[slotA]);
             (_slotLastUnsatisfiableTraceIndex[slotA], _slotLastUnsatisfiableTraceIndex[slotB]) = (
                 _slotLastUnsatisfiableTraceIndex[slotB], _slotLastUnsatisfiableTraceIndex[slotA]);
             (_slotStaggerApplied[slotA], _slotStaggerApplied[slotB]) = (
@@ -441,7 +537,7 @@ public sealed class PlaybackService(
 
     public async Task GoBackSlotAsync(int slotIndex)
     {
-        if (!CanGoBackSlot(slotIndex) || Status != PlaybackStatus.Playing)
+        if (!CanGoBackSlot(slotIndex) || Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
         {
             return;
         }
@@ -459,32 +555,55 @@ public sealed class PlaybackService(
 
         lock (_slotStateLock)
         {
-            var history = _slotHistory[slotIndex];
-
-            while (history.Count > 0)
+            if (!TryPopValidNavigationIndexLocked(_slotHistory[slotIndex], out targetIndex))
             {
-                var candidate = history.Last!.Value;
-                history.RemoveLast();
-
-                if (candidate >= 0 && candidate < playlistService.Items.Count)
-                {
-                    targetIndex = candidate;
-                    goto found;
-                }
+                return;
             }
-
-            return;
         }
-
-        found:
 
         debugLog.Info($"Slot {slotIndex + 1} going back to index={targetIndex}; item={playlistService.Items[targetIndex].DisplayName}.");
 
         lock (_slotStateLock)
         {
+            PushSlotForwardLocked(slotIndex, _slotIndices[slotIndex]);
             _slotIndices[slotIndex] = targetIndex;
             _slotNativeGenerations[slotIndex] = null;
         }
+
+        await PlaySingleSlotAsync(slotIndex, forceRestartTimer: true, restartVideoIfSameSource: true);
+        NotifyChanged();
+    }
+
+    private bool HasSlotForwardEntries(int slotIndex)
+    {
+        lock (_slotStateLock)
+        {
+            return _slotForward[slotIndex].Count > 0;
+        }
+    }
+
+    private async Task GoForwardSlotAsync(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots || Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
+        {
+            return;
+        }
+
+        int targetIndex;
+
+        lock (_slotStateLock)
+        {
+            if (!TryPopValidNavigationIndexLocked(_slotForward[slotIndex], out targetIndex))
+            {
+                return;
+            }
+
+            PushSlotHistoryLocked(slotIndex, _slotIndices[slotIndex]);
+            _slotIndices[slotIndex] = targetIndex;
+            _slotNativeGenerations[slotIndex] = null;
+        }
+
+        debugLog.Info($"Slot {slotIndex + 1} going forward to index={targetIndex}; item={playlistService.Items[targetIndex].DisplayName}.");
 
         await PlaySingleSlotAsync(slotIndex, forceRestartTimer: true, restartVideoIfSameSource: true);
         NotifyChanged();
@@ -588,6 +707,7 @@ public sealed class PlaybackService(
                 lock (_slotStateLock)
                 {
                     _slotHistory[i].Clear();
+                    _slotForward[i].Clear();
                 }
             }
         }
@@ -656,24 +776,74 @@ public sealed class PlaybackService(
 
     public void UpdateVideoProgress(double positionSeconds, double durationSeconds)
     {
+        if (IsSlotScrubbing(0))
+        {
+            debugLog.Trace("PaneSeek: TRACE progress tick suppressed during scrub slot=0.");
+            return;
+        }
+
         VideoPosition = TimeSpan.FromSeconds(Math.Max(0, positionSeconds));
         VideoDuration = TimeSpan.FromSeconds(Math.Max(0, durationSeconds));
         NotifyChanged();
     }
 
-    public async Task SeekAsync(double seconds)
+    private void OnSlotProgressChanged(int slotIndex, double positionSeconds, double durationSeconds)
     {
-        var maxSeconds = VideoDuration.TotalSeconds > 0 ? VideoDuration.TotalSeconds : Math.Max(0, seconds);
-        var safeSeconds = Math.Clamp(seconds, 0, maxSeconds);
-        VideoPosition = TimeSpan.FromSeconds(safeSeconds);
-        debugLog.Trace($"Seek requested: {safeSeconds:0.##}s.");
-
-        if (GetSlotItem(0)?.Kind == MediaKind.Video)
+        if (slotIndex < 0 || slotIndex >= MaxSlots)
         {
-            await nativeVideoPlayback.SeekAsync(safeSeconds);
+            return;
         }
 
-        NotifyChanged();
+        if (_slotScrubbing[slotIndex])
+        {
+            debugLog.Trace($"PaneSeek: TRACE progress tick suppressed during scrub slot={slotIndex}.");
+            return;
+        }
+
+        _slotVideoPosition[slotIndex] = TimeSpan.FromSeconds(Math.Max(0, positionSeconds));
+        _slotVideoDuration[slotIndex] = TimeSpan.FromSeconds(Math.Max(0, durationSeconds));
+    }
+
+    public Task SeekAsync(double seconds) => SeekSlotAsync(0, seconds);
+
+    public async Task SeekSlotAsync(int slotIndex, double seconds)
+    {
+        if (!IsActiveSlot(slotIndex))
+        {
+            return;
+        }
+
+        var item = GetSlotItem(slotIndex);
+
+        if (item?.Kind != MediaKind.Video)
+        {
+            return;
+        }
+
+        if (Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused))
+        {
+            return;
+        }
+
+        var maxSeconds = _slotVideoDuration[slotIndex].TotalSeconds > 0
+            ? _slotVideoDuration[slotIndex].TotalSeconds
+            : Math.Max(0, seconds);
+        var safeSeconds = Math.Clamp(seconds, 0, maxSeconds > 0 ? maxSeconds : Math.Max(0, seconds));
+        _slotVideoPosition[slotIndex] = TimeSpan.FromSeconds(safeSeconds);
+
+        if (slotIndex == 0)
+        {
+            VideoPosition = TimeSpan.FromSeconds(safeSeconds);
+        }
+
+        debugLog.Debug($"PaneSeek: DEBUG seek slot {slotIndex} → {safeSeconds:0.##}s; file={item.DisplayName}.");
+
+        await nativeVideoPlayback.SeekSlotAsync(slotIndex, safeSeconds);
+
+        if (!_slotScrubbing[slotIndex])
+        {
+            NotifyChanged();
+        }
     }
 
     public async Task RefreshPlaylistAsync()
@@ -681,10 +851,16 @@ public sealed class PlaybackService(
         ResetSlotIndicesFromCurrent();
         PruneImageCacheToPlaylist();
 
-        if (Status == PlaybackStatus.Playing)
+        if (Status is PlaybackStatus.Playing or PlaybackStatus.Paused)
         {
+            var wasPaused = Status == PlaybackStatus.Paused;
             debugLog.Debug("Refreshing playback after playlist order/content change.");
             await PlayVisibleSlotsAsync(forceRestartTimers: true);
+
+            if (wasPaused)
+            {
+                await nativeVideoPlayback.PauseAsync();
+            }
         }
 
         NotifyChanged();
@@ -742,7 +918,12 @@ public sealed class PlaybackService(
 
     private async Task CompleteSlotAsync(int slotIndex, string? expectedPath, int? playbackGeneration, bool forceAdvance = false)
     {
-        if (Status != PlaybackStatus.Playing || !IsActiveSlot(slotIndex))
+        if (Status is not (PlaybackStatus.Playing or PlaybackStatus.Paused) || !IsActiveSlot(slotIndex))
+        {
+            return;
+        }
+
+        if (Status == PlaybackStatus.Paused && !forceAdvance)
         {
             return;
         }
@@ -831,6 +1012,7 @@ public sealed class PlaybackService(
 
             lock (_slotStateLock)
             {
+                _slotForward[slotIndex].Clear();
                 PushSlotHistoryLocked(slotIndex, _slotIndices[slotIndex]);
             }
 
@@ -1020,9 +1202,23 @@ public sealed class PlaybackService(
 
         var item = GetSlotItem(slotIndex);
         debugLog.Trace($"Refreshing slot {slotIndex + 1}. forceRestartTimer={forceRestartTimer}; restartVideoIfSameSource={restartVideoIfSameSource}; index={_slotIndices[slotIndex]}; item={item?.DisplayName} ({item?.Kind}); {Settings.FormatForDebugLogCompact()}.");
+
+        if (item?.Kind != MediaKind.Video)
+        {
+            ClearSlotVideoProgress(slotIndex);
+        }
+
         StopSlotTimer(slotIndex);
         await nativeVideoPlayback.PlaySlotAsync(slotIndex, item, Settings, restartVideoIfSameSource);
         await EnsureSlotTimerAsync(slotIndex, forceRestartTimer);
+
+        // PlaySlotAsync auto-starts video; re-pause when the session is paused (back/skip/
+        // dislike/swap while paused) so playback does not resume until the user hits Play.
+        if (Status == PlaybackStatus.Paused)
+        {
+            StopAllSlotTimers();
+            await nativeVideoPlayback.PauseAsync();
+        }
     }
 
     private async Task EnsureSlotTimersAsync(bool forceRestartTimers)
@@ -1326,6 +1522,7 @@ public sealed class PlaybackService(
                     || (shuffleRequirement != MediaKindRequirement.Any
                         && TryAdvanceFromShuffleLocked(slotIndex, MediaKindRequirement.Any, out shuffleIndex)))
                 {
+                    _slotForward[slotIndex].Clear();
                     PushSlotHistoryLocked(slotIndex, outgoingIndex);
                     _slotIndices[slotIndex] = shuffleIndex;
                     return true;
@@ -1420,6 +1617,7 @@ public sealed class PlaybackService(
 
             if (advanced)
             {
+                _slotForward[slotIndex].Clear();
                 PushSlotHistoryLocked(slotIndex, outgoingIndex);
             }
 
@@ -2007,7 +2205,12 @@ public sealed class PlaybackService(
 
         if (Status is PlaybackStatus.Playing or PlaybackStatus.Paused)
         {
-            bool anySlotChanged;
+            if (_dislikeSlotAdvanceTarget >= 0)
+            {
+                return;
+            }
+
+            List<int> changedSlots;
 
             lock (_slotStateLock)
             {
@@ -2019,13 +2222,22 @@ public sealed class PlaybackService(
                 var before = new int[MaxSlots];
                 Array.Copy(_slotIndices, before, MaxSlots);
                 AlignSlotsToEligibilityLocked();
-                anySlotChanged = !before.AsSpan().SequenceEqual(_slotIndices);
+                changedSlots = new List<int>();
+
+                for (var slotIndex = 0; slotIndex < MaxSlots; slotIndex++)
+                {
+                    if (before[slotIndex] != _slotIndices[slotIndex] && IsActiveSlot(slotIndex))
+                    {
+                        changedSlots.Add(slotIndex);
+                    }
+                }
             }
 
-            if (anySlotChanged)
+            if (changedSlots.Count > 0)
             {
-                debugLog.Debug("Favorite/filter/dislike change displaced one or more slots; refreshing affected panes.");
-                _ = RefreshVisibleSlotsAfterEligibilityChangeAsync();
+                debugLog.Debug(
+                    $"Favorite/filter/dislike change displaced slot(s) {string.Join(", ", changedSlots.Select(static index => index + 1))}; refreshing affected panes.");
+                _ = RefreshSlotsAfterEligibilityChangeAsync(changedSlots);
             }
 
             return;
@@ -2040,10 +2252,19 @@ public sealed class PlaybackService(
         }
     }
 
-    private async Task RefreshVisibleSlotsAfterEligibilityChangeAsync()
+    private async Task RefreshSlotsAfterEligibilityChangeAsync(IReadOnlyList<int> changedSlots)
     {
+        if (changedSlots.Count == 0)
+        {
+            return;
+        }
+
         var wasPaused = Status == PlaybackStatus.Paused;
-        await PlayVisibleSlotsAsync(forceRestartTimers: true);
+
+        foreach (var slotIndex in changedSlots)
+        {
+            await PlaySingleSlotAsync(slotIndex, forceRestartTimer: true, restartVideoIfSameSource: true);
+        }
 
         if (wasPaused)
         {
@@ -2610,6 +2831,42 @@ public sealed class PlaybackService(
         }
     }
 
+    private void PushSlotForwardLocked(int slotIndex, int outgoingPlaylistIndex)
+    {
+        if (outgoingPlaylistIndex < 0)
+        {
+            return;
+        }
+
+        var forward = _slotForward[slotIndex];
+        forward.AddLast(outgoingPlaylistIndex);
+
+        while (forward.Count > MaxSlotHistoryDepth)
+        {
+            forward.RemoveFirst();
+        }
+    }
+
+    private bool TryPopValidNavigationIndexLocked(LinkedList<int> stack, out int playlistIndex)
+    {
+        var count = playlistService.Items.Count;
+
+        while (stack.Count > 0)
+        {
+            var candidate = stack.Last!.Value;
+            stack.RemoveLast();
+
+            if (candidate >= 0 && candidate < count)
+            {
+                playlistIndex = candidate;
+                return true;
+            }
+        }
+
+        playlistIndex = -1;
+        return false;
+    }
+
     private void ClearSlotLockAndHistoryLocked()
     {
         Array.Fill(_slotLocked, false);
@@ -2617,6 +2874,37 @@ public sealed class PlaybackService(
         foreach (var h in _slotHistory)
         {
             h.Clear();
+        }
+
+        foreach (var f in _slotForward)
+        {
+            f.Clear();
+        }
+    }
+
+    private void ClearSlotVideoProgress(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= MaxSlots)
+        {
+            return;
+        }
+
+        _slotVideoPosition[slotIndex] = TimeSpan.Zero;
+        _slotVideoDuration[slotIndex] = TimeSpan.Zero;
+        _slotScrubbing[slotIndex] = false;
+
+        if (slotIndex == 0)
+        {
+            VideoPosition = TimeSpan.Zero;
+            VideoDuration = TimeSpan.Zero;
+        }
+    }
+
+    private void ClearAllSlotVideoProgress()
+    {
+        for (var slotIndex = 0; slotIndex < MaxSlots; slotIndex++)
+        {
+            ClearSlotVideoProgress(slotIndex);
         }
     }
 
@@ -2629,6 +2917,7 @@ public sealed class PlaybackService(
     {
         StopAllSlotTimers();
         nativeVideoPlayback.ProgressChanged -= UpdateVideoProgress;
+        nativeVideoPlayback.SlotProgressChanged -= OnSlotProgressChanged;
         nativeVideoPlayback.EndReached -= OnNativeVideoEnded;
         nativeVideoPlayback.PlaybackStarted -= OnNativeVideoStarted;
         playlistService.Changed -= PruneImageCacheToPlaylist;

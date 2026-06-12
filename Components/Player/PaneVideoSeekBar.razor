@@ -1,0 +1,148 @@
+@implements IDisposable
+@inject NativeVideoPlaybackService NativeVideo
+@inject PlaybackService Playback
+
+<div class="media-pane-seek @(_isScrubbing ? "is-scrubbing" : null)"
+     @onpointerdown="BeginScrubAsync"
+     @onpointerdown:stopPropagation="true"
+     @onclick:stopPropagation="true">
+    <span class="media-pane-seek-time">@FormatTime(DisplayPosition)</span>
+    <input class="media-pane-seek-range"
+           type="range"
+           min="0"
+           max="@Math.Max(1, ProgressMaxSeconds)"
+           step="0.1"
+           value="@Math.Min(ProgressMaxSeconds, DisplayPositionSeconds)"
+           @oninput="OnScrubInputAsync"
+           @onpointerup="EndScrubAsync"
+           @onpointercancel="EndScrubAsync"
+           disabled="@(!IsSeekEnabled)"
+           aria-label="Pane video progress" />
+    <span class="media-pane-seek-time">@FormatTime(DisplayDuration)</span>
+</div>
+
+@code {
+    [Parameter] public int SlotIndex { get; set; }
+
+    private const int SeekThrottleMs = 120;
+
+    private double _positionSec;
+    private double _durationSec;
+    private double _scrubPositionSec;
+    private bool _isScrubbing;
+    private CancellationTokenSource? _pendingSeekCts;
+
+    private double DisplayPositionSeconds => _isScrubbing ? _scrubPositionSec : _positionSec;
+
+    private TimeSpan DisplayPosition => TimeSpan.FromSeconds(DisplayPositionSeconds);
+
+    private TimeSpan DisplayDuration => TimeSpan.FromSeconds(_durationSec);
+
+    private double ProgressMaxSeconds => _durationSec > 0 ? _durationSec : 1;
+
+    private bool IsSeekEnabled =>
+        _durationSec > 0.5
+        && Playback.Status is PlaybackStatus.Playing or PlaybackStatus.Paused;
+
+    protected override void OnInitialized()
+    {
+        NativeVideo.SlotProgressChanged += OnSlotProgressChanged;
+        _positionSec = Playback.GetSlotVideoPosition(SlotIndex).TotalSeconds;
+        _durationSec = Playback.GetSlotVideoDuration(SlotIndex).TotalSeconds;
+    }
+
+    private void OnSlotProgressChanged(int slotIndex, double positionSeconds, double durationSeconds)
+    {
+        if (slotIndex != SlotIndex || _isScrubbing)
+        {
+            return;
+        }
+
+        _positionSec = positionSeconds;
+        _durationSec = durationSeconds;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private async Task BeginScrubAsync(PointerEventArgs args)
+    {
+        if (!IsSeekEnabled || args.Button is not 0 and not (-1))
+        {
+            return;
+        }
+
+        _isScrubbing = true;
+        _scrubPositionSec = _positionSec;
+        Playback.SetSlotScrubbing(SlotIndex, true);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task OnScrubInputAsync(ChangeEventArgs args)
+    {
+        if (!double.TryParse(args.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+        {
+            return;
+        }
+
+        _scrubPositionSec = seconds;
+        await InvokeAsync(StateHasChanged);
+        await ScheduleThrottledSeekAsync(seconds);
+    }
+
+    private async Task ScheduleThrottledSeekAsync(double seconds)
+    {
+        _pendingSeekCts?.Cancel();
+        _pendingSeekCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _pendingSeekCts = cts;
+
+        try
+        {
+            await Task.Delay(SeekThrottleMs, cts.Token);
+            await Playback.SeekSlotAsync(SlotIndex, seconds);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task EndScrubAsync(PointerEventArgs args)
+    {
+        if (!_isScrubbing)
+        {
+            return;
+        }
+
+        _pendingSeekCts?.Cancel();
+        _pendingSeekCts?.Dispose();
+        _pendingSeekCts = null;
+
+        var finalSeconds = _scrubPositionSec;
+        _isScrubbing = false;
+        Playback.SetSlotScrubbing(SlotIndex, false);
+        await Playback.SeekSlotAsync(SlotIndex, finalSeconds);
+        _positionSec = finalSeconds;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private static string FormatTime(TimeSpan time)
+    {
+        if (time.TotalSeconds <= 0)
+        {
+            return "0:00";
+        }
+
+        return time.TotalHours >= 1 ? time.ToString(@"h\:mm\:ss") : time.ToString(@"m\:ss");
+    }
+
+    public void Dispose()
+    {
+        if (_isScrubbing)
+        {
+            Playback.SetSlotScrubbing(SlotIndex, false);
+        }
+
+        _pendingSeekCts?.Cancel();
+        _pendingSeekCts?.Dispose();
+        NativeVideo.SlotProgressChanged -= OnSlotProgressChanged;
+    }
+}

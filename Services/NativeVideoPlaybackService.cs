@@ -30,6 +30,8 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
 
     public event Action<double, double>? ProgressChanged;
 
+    public event Action<int, double, double>? SlotProgressChanged;
+
     public event Action<int, string?, int, string>? EndReached;
 
     public event Action<int, string, int>? PlaybackStarted;
@@ -413,6 +415,7 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
     // suppression simply flips the logical visibility without exposing pixels.
     // The opacity/bounds are then restored together on unsuppress.
     private volatile bool _overlaySuppressed;
+    private readonly HashSet<int> _pauseOverlaySuppressedSlots = [];
     private readonly HashSet<int> _paneSwapSuppressedSlots = [];
 
     public Rect GetLastBounds(int slotIndex) =>
@@ -468,7 +471,95 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
     }
 
     private bool IsSlotChromeSuppressed(VideoSlot slot) =>
-        _overlaySuppressed || _paneSwapSuppressedSlots.Contains(slot.Index);
+        _overlaySuppressed
+        || _pauseOverlaySuppressedSlots.Contains(slot.Index)
+        || _paneSwapSuppressedSlots.Contains(slot.Index);
+
+    private static bool IsPauseOverlayVideoCandidate(VideoSlot slot) =>
+        slot.IsVisible && slot.CurrentPath is not null && slot.MediaElement is not null;
+
+    // The WebView pause/play overlay is painted in HTML below the native SwapChainPanel.
+    // Hide native video pixels on active video slots while paused so the dim overlay and
+    // play icon are visible. Only touch slots that are actually showing video — suppressing
+    // every registered MediaElement exposed stale HTML holdovers under image panes and let
+    // dormant slots fight ReconcileSlotChrome on resume.
+    public Task SuppressForPauseOverlayAsync(bool suppress, IReadOnlyList<int> videoSlotIndices)
+    {
+        return MainThread.InvokeOnMainThreadAsync(() =>
+        {
+            if (!suppress)
+            {
+                ClearPauseOverlaySuppressionLocked("pause-overlay-unsuppress");
+                return;
+            }
+
+            var desiredSlots = new HashSet<int>();
+
+            foreach (var slotIndex in videoSlotIndices)
+            {
+                if (!TryGetSlot(slotIndex, out var slot) || !IsPauseOverlayVideoCandidate(slot))
+                {
+                    continue;
+                }
+
+                desiredSlots.Add(slotIndex);
+            }
+
+            foreach (var slotIndex in _pauseOverlaySuppressedSlots.Where(index => !desiredSlots.Contains(index)).ToArray())
+            {
+                _pauseOverlaySuppressedSlots.Remove(slotIndex);
+
+                if (TryGetSlot(slotIndex, out var slot))
+                {
+                    ReconcileSlotChromeLocked(slot, "pause-overlay-resync");
+                }
+            }
+
+            foreach (var slotIndex in desiredSlots)
+            {
+                if (!TryGetSlot(slotIndex, out var slot) || slot.MediaElement is null)
+                {
+                    continue;
+                }
+
+                if (!_pauseOverlaySuppressedSlots.Add(slotIndex))
+                {
+                    continue;
+                }
+
+                TrySetMediaElementChrome(slot.MediaElement, HiddenBounds, 0);
+            }
+        });
+    }
+
+    public Task ClearPauseOverlaySuppressionAsync()
+    {
+        if (_pauseOverlaySuppressedSlots.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        return MainThread.InvokeOnMainThreadAsync(() => ClearPauseOverlaySuppressionLocked("pause-overlay-clear"));
+    }
+
+    private void ClearPauseOverlaySuppressionLocked(string reason)
+    {
+        if (_pauseOverlaySuppressedSlots.Count == 0)
+        {
+            return;
+        }
+
+        var slots = _pauseOverlaySuppressedSlots.ToArray();
+        _pauseOverlaySuppressedSlots.Clear();
+
+        foreach (var slotIndex in slots)
+        {
+            if (TryGetSlot(slotIndex, out var slot))
+            {
+                ReconcileSlotChromeLocked(slot, reason);
+            }
+        }
+    }
 
     public Task SuppressForOverlayAsync(bool suppress)
     {
@@ -622,43 +713,148 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         debugLog.Debug("Native video stopped.");
     }
 
-    public async Task SeekAsync(double seconds)
-    {
-        var primarySlot = _slots[0];
+    public Task SeekAsync(double seconds) => SeekSlotAsync(0, seconds);
 
-        if (primarySlot.MediaElement is null)
+    public Task SeekSlotAsync(int slotIndex, double seconds)
+    {
+        if (!TryGetSlot(slotIndex, out var slot))
         {
+            return Task.CompletedTask;
+        }
+
+        return MainThread.InvokeOnMainThreadAsync(() => EnqueueSeekSlotAsync(slot, seconds));
+    }
+
+    private void EnqueueSeekSlotAsync(VideoSlot slot, double seconds)
+    {
+        slot.PendingSeekTarget = seconds;
+
+        if (slot.SeekInFlight)
+        {
+            debugLog.Trace($"PaneSeek: TRACE seek coalesced slot={slot.Index}; target={seconds:0.###}s; file={Path.GetFileName(slot.CurrentPath)}.");
             return;
         }
 
-        await MainThread.InvokeOnMainThreadAsync(async () =>
+        _ = ExecuteSeekSlotAsync(slot);
+    }
+
+    private async Task ExecuteSeekSlotAsync(VideoSlot slot)
+    {
+        while (slot.PendingSeekTarget is double requestedSeconds)
         {
-            if (primarySlot.MediaElement is null)
-            {
-                return;
-            }
+            slot.PendingSeekTarget = null;
+            slot.SeekInFlight = true;
+            var deferred = false;
 
             try
             {
-                if (primarySlot.MediaElement is not null
-                    && TryReadPlaybackSnapshot(primarySlot.MediaElement, out _, out _, out var seekState)
-                    && seekState == MediaElementState.Opening)
-                {
-                    return;
-                }
+                deferred = await PerformSeekSlotAsync(slot, requestedSeconds);
+            }
+            finally
+            {
+                slot.SeekInFlight = false;
+            }
 
-                await primarySlot.MediaElement.SeekTo(TimeSpan.FromSeconds(Math.Max(0, seconds)), CancellationToken.None);
-                PublishProgress(primarySlot);
-            }
-            catch (COMException exception)
+            if (deferred && slot.PendingSeekTarget is not null)
             {
-                debugLog.Trace($"Native video seek deferred: {exception.Message}");
+                await Task.Delay(100);
             }
-            catch (InvalidOperationException exception)
-            {
-                debugLog.Trace($"Native video seek deferred: {exception.Message}");
-            }
-        });
+        }
+    }
+
+    private async Task<bool> PerformSeekSlotAsync(VideoSlot slot, double seconds)
+    {
+        if (slot.MediaElement is null || slot.CurrentPath is null)
+        {
+            return false;
+        }
+
+        MediaElementState seekState;
+        try
+        {
+            seekState = slot.MediaElement.CurrentState;
+        }
+        catch (COMException exception)
+        {
+            debugLog.Trace($"PaneSeek: TRACE deferred slot={slot.Index}; {exception.Message}");
+            slot.PendingSeekTarget = seconds;
+            return true;
+        }
+        catch (InvalidOperationException exception)
+        {
+            debugLog.Trace($"PaneSeek: TRACE deferred slot={slot.Index}; {exception.Message}");
+            slot.PendingSeekTarget = seconds;
+            return true;
+        }
+
+        if (seekState is MediaElementState.Opening or MediaElementState.Buffering)
+        {
+            slot.PendingSeekTarget = seconds;
+            debugLog.Trace($"PaneSeek: TRACE deferred {seekState.ToString().ToLowerInvariant()} slot={slot.Index}; target={seconds:0.###}s; file={Path.GetFileName(slot.CurrentPath)}.");
+            return true;
+        }
+
+        if (!TryReadPlaybackSnapshot(slot.MediaElement, out _, out var elementDuration, out _))
+        {
+            slot.PendingSeekTarget = seconds;
+            debugLog.Trace($"PaneSeek: TRACE deferred unreadable slot={slot.Index}; target={seconds:0.###}s; file={Path.GetFileName(slot.CurrentPath)}.");
+            return true;
+        }
+
+        var effectiveDuration = GetEffectiveDuration(slot, elementDuration);
+        var maxSeconds = effectiveDuration.TotalSeconds > 0.5
+            ? effectiveDuration.TotalSeconds
+            : Math.Max(0, seconds);
+        var clampedSeconds = Math.Clamp(seconds, 0, maxSeconds);
+        var seekPosition = TimeSpan.FromSeconds(clampedSeconds);
+
+        try
+        {
+            await slot.MediaElement.SeekTo(seekPosition, CancellationToken.None);
+            slot.LastProgressPositionSeconds = -1;
+            RearmEndDetectionAfterSeek(slot, seekPosition, effectiveDuration);
+            debugLog.Debug($"PaneSeek: DEBUG seek committed slot={slot.Index}; target={clampedSeconds:0.###}s; file={Path.GetFileName(slot.CurrentPath)}.");
+            PublishProgress(slot);
+            return false;
+        }
+        catch (COMException exception)
+        {
+            debugLog.Trace($"PaneSeek: TRACE deferred slot={slot.Index}; {exception.Message}");
+            slot.PendingSeekTarget = seconds;
+            return true;
+        }
+        catch (InvalidOperationException exception)
+        {
+            debugLog.Trace($"PaneSeek: TRACE deferred slot={slot.Index}; {exception.Message}");
+            slot.PendingSeekTarget = seconds;
+            return true;
+        }
+    }
+
+    private void RearmEndDetectionAfterSeek(VideoSlot slot, TimeSpan position, TimeSpan duration)
+    {
+        if (duration.TotalSeconds <= 0.5)
+        {
+            slot.ProgressEndCheckArmed = false;
+            return;
+        }
+
+        if (position.TotalSeconds >= duration.TotalSeconds - 0.25)
+        {
+            debugLog.Trace($"PaneSeek: TRACE end-check immediate slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}.");
+            SignalEndIfProgressReachedDuration(slot, position, duration);
+            return;
+        }
+
+        if (position.TotalSeconds > 0.05 && position.TotalSeconds < duration.TotalSeconds - 0.5)
+        {
+            slot.ProgressEndCheckArmed = true;
+            debugLog.Trace($"PaneSeek: TRACE end-check re-arm slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}.");
+            return;
+        }
+
+        slot.ProgressEndCheckArmed = false;
+        debugLog.Trace($"PaneSeek: TRACE end-check disarmed slot={slot.Index}; {PlaybackDiagnostics.FormatTimeline(position, duration)}.");
     }
 
     public void ApplySettings(PlaybackSettings settings)
@@ -1002,12 +1198,15 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
             slot.LastProgressPositionSeconds = safePosition.TotalSeconds;
         }
 
+        var displayDuration = safeDuration.TotalSeconds > 0.5 ? safeDuration : elementDuration;
+        var positionSeconds = Math.Max(0, safePosition.TotalSeconds);
+        var durationSeconds = Math.Max(0, displayDuration.TotalSeconds);
+
+        SlotProgressChanged?.Invoke(slot.Index, positionSeconds, durationSeconds);
+
         if (slot.Index == 0)
         {
-            var displayDuration = safeDuration.TotalSeconds > 0.5 ? safeDuration : elementDuration;
-            ProgressChanged?.Invoke(
-                Math.Max(0, safePosition.TotalSeconds),
-                Math.Max(0, displayDuration.TotalSeconds));
+            ProgressChanged?.Invoke(positionSeconds, durationSeconds);
         }
 
         PublishProgressHeartbeat(slot, safePosition, elementDuration, currentState);
@@ -1765,6 +1964,10 @@ public sealed class NativeVideoPlaybackService(DebugLogService debugLog, VideoMe
         public DateTimeOffset LastMidFileRecoveryAt { get; set; } = DateTimeOffset.MinValue;
 
         public DateTimeOffset? PausedStateStartedAt { get; set; }
+
+        public double? PendingSeekTarget { get; set; }
+
+        public bool SeekInFlight { get; set; }
 
         public void CacheSnapshot(TimeSpan position, TimeSpan duration, MediaElementState state)
         {
