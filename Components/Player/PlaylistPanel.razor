@@ -46,14 +46,20 @@
             }
         </div>
 
-        <div class="playlist-filter-chips" role="tablist" aria-label="Playlist source">
+        <div class="playlist-filter-chips" role="group" aria-label="Playlist source">
+            <button class="filter-chip @(IsAllSourcesEnabled ? "is-active" : null)"
+                    type="button"
+                    aria-pressed="@(IsAllSourcesEnabled ? "true" : "false")"
+                    title="Show all library items"
+                    @onclick="EnableAllPlaylistSourcesAsync">
+                All
+            </button>
             @foreach (var chip in SourceChips)
             {
-                <button class="filter-chip @(Playback.Settings.PlaylistSource == chip.Source ? "is-active" : null)"
+                <button class="filter-chip @(IsSourceEnabled(chip.Filter) ? "is-active" : null)"
                         type="button"
-                        role="tab"
-                        aria-selected="@(Playback.Settings.PlaylistSource == chip.Source ? "true" : "false")"
-                        @onclick="() => SetPlaylistSourceAsync(chip.Source)">
+                        aria-pressed="@(IsSourceEnabled(chip.Filter) ? "true" : "false")"
+                        @onclick="() => TogglePlaylistSourceAsync(chip.Filter)">
                     @chip.Label
                 </button>
             }
@@ -96,7 +102,7 @@
                         disabled="@(!Playlist.HasItems)">
                     <Icon Name="dice-5-fill" />
                 </button>
-                @if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly && Playback.DislikeCountInPlaylist > 0)
+                @if (Playback.Settings.IsPlaylistSourceFilterEnabled(PlaylistSourceFilters.Dislikes) && Playback.DislikeCountInPlaylist > 0)
                 {
                     <button class="btn btn-sm btn-outline-secondary playlist-clear-dislikes-btn"
                             type="button"
@@ -105,7 +111,7 @@
                         Clear dislikes
                     </button>
                 }
-                @if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly && Playback.SuperLikeCountInPlaylist > 0)
+                @if (Playback.Settings.IsPlaylistSourceFilterEnabled(PlaylistSourceFilters.SuperLikes) && Playback.SuperLikeCountInPlaylist > 0)
                 {
                     <button class="btn btn-sm btn-outline-secondary playlist-clear-superlikes-btn"
                             type="button"
@@ -128,21 +134,21 @@
     else if (FilteredItems.Count == 0)
     {
         <div class="playlist-empty">
-            @if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly
+            @if (IsOnlySourceFilter(PlaylistSourceFilters.Favorites)
                  && Playback.FavoriteCountInPlaylist == 0)
             {
                 <Icon Name="heart-fill" Size="22" />
                 <div>No favorites in this library.</div>
                 <div class="form-text">Use the heart on a pane while hovering to add favorites.</div>
             }
-            else if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly
+            else if (IsOnlySourceFilter(PlaylistSourceFilters.Dislikes)
                      && Playback.DislikeCountInPlaylist == 0)
             {
                 <Icon Name="heartbreak-fill" Size="22" />
                 <div>No dislikes in this library.</div>
                 <div class="form-text">Use the broken heart on a pane while hovering to mark dislikes.</div>
             }
-            else if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly
+            else if (IsOnlySourceFilter(PlaylistSourceFilters.SuperLikes)
                      && Playback.SuperLikeCountInPlaylist == 0)
             {
                 <Icon Name="heart-fire-fill" Size="22" />
@@ -248,12 +254,11 @@
     private SortMode _sortMode = SortMode.Name;
     private List<MediaItem> _filteredItems = [];
 
-    private static readonly IReadOnlyList<(PlaylistSource Source, string Label)> SourceChips =
+    private static readonly IReadOnlyList<(PlaylistSourceFilters Filter, string Label)> SourceChips =
     [
-        (PlaylistSource.AllLibrary, "All"),
-        (PlaylistSource.FavoritesOnly, "Favorites"),
-        (PlaylistSource.DislikesOnly, "Dislikes"),
-        (PlaylistSource.SuperLikesOnly, "Super"),
+        (PlaylistSourceFilters.Favorites, "Favorites"),
+        (PlaylistSourceFilters.Dislikes, "Dislikes"),
+        (PlaylistSourceFilters.SuperLikes, "Super Favorites"),
     ];
 
     private static readonly IReadOnlyList<(MediaKind Kind, string Label)> KindChips =
@@ -262,6 +267,15 @@
         (MediaKind.Video, "Videos"),
         (MediaKind.Gif, "GIFs"),
     ];
+
+    private bool IsAllSourcesEnabled => Playback.Settings.IsAllPlaylistSourcesEnabled;
+
+    private bool IsSourceEnabled(PlaylistSourceFilters filter) =>
+        Playback.Settings.IsPlaylistSourceFilterEnabled(filter);
+
+    private bool IsOnlySourceFilter(PlaylistSourceFilters filter) =>
+        !Playback.Settings.IsAllPlaylistSourcesEnabled
+        && Playback.Settings.EnabledPlaylistSources == filter;
 
     private bool IsAllKindsEnabled => Playback.Settings.IsAllMediaKindsEnabled;
 
@@ -314,9 +328,7 @@
 
             parts.Add($"{total} total");
 
-            if (Playback.Settings.PlaylistSource is PlaylistSource.FavoritesOnly
-                    or PlaylistSource.DislikesOnly
-                    or PlaylistSource.SuperLikesOnly
+            if (!Playback.Settings.IsAllPlaylistSourcesEnabled
                 || !Playback.Settings.IsAllMediaKindsEnabled)
             {
                 var shown = _filteredItems.Count;
@@ -399,14 +411,38 @@
         _ => PlaybackMediaKinds.None
     };
 
-    private async Task SetPlaylistSourceAsync(PlaylistSource source)
+    private async Task EnableAllPlaylistSourcesAsync()
     {
-        if (Playback.Settings.PlaylistSource == source)
+        if (Playback.Settings.IsAllPlaylistSourcesEnabled)
         {
             return;
         }
 
-        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = source);
+        await Playback.UpdateSettingsAsync(s => s.EnabledPlaylistSources = PlaylistSourceFilters.None);
+        RebuildFilteredItems();
+    }
+
+    private async Task TogglePlaylistSourceAsync(PlaylistSourceFilters filter)
+    {
+        var current = Playback.Settings.EnabledPlaylistSources;
+
+        if (current == PlaylistSourceFilters.None)
+        {
+            await Playback.UpdateSettingsAsync(s => s.EnabledPlaylistSources = filter);
+        }
+        else if (current.HasFlag(filter))
+        {
+            var remaining = current & ~filter;
+            await Playback.UpdateSettingsAsync(s =>
+                s.EnabledPlaylistSources = remaining == PlaylistSourceFilters.None
+                    ? PlaylistSourceFilters.None
+                    : remaining);
+        }
+        else
+        {
+            await Playback.UpdateSettingsAsync(s => s.EnabledPlaylistSources = current | filter);
+        }
+
         RebuildFilteredItems();
     }
 
@@ -414,17 +450,13 @@
     {
         IEnumerable<MediaItem> items = Playlist.Items;
 
-        if (Playback.Settings.PlaylistSource == PlaylistSource.FavoritesOnly)
+        if (!Playback.Settings.IsAllPlaylistSourcesEnabled)
         {
-            items = items.Where(item => Favorites.IsFavorite(item.FilePath));
-        }
-        else if (Playback.Settings.PlaylistSource == PlaylistSource.DislikesOnly)
-        {
-            items = items.Where(item => Dislikes.IsDisliked(item.FilePath));
-        }
-        else if (Playback.Settings.PlaylistSource == PlaylistSource.SuperLikesOnly)
-        {
-            items = items.Where(item => SuperLikes.IsSuperLiked(item.FilePath));
+            var filters = Playback.Settings.EnabledPlaylistSources;
+            items = items.Where(item =>
+                (filters.HasFlag(PlaylistSourceFilters.Favorites) && Favorites.IsFavorite(item.FilePath))
+                || (filters.HasFlag(PlaylistSourceFilters.Dislikes) && Dislikes.IsDisliked(item.FilePath))
+                || (filters.HasFlag(PlaylistSourceFilters.SuperLikes) && SuperLikes.IsSuperLiked(item.FilePath)));
         }
 
         items = items.Where(item => Playback.Settings.IsMediaKindEnabled(item.Kind));
@@ -476,7 +508,7 @@
 
         await Playback.UpdateSettingsAsync(s =>
         {
-            s.PlaylistSource = PlaylistSource.AllLibrary;
+            s.EnabledPlaylistSources = PlaylistSourceFilters.None;
             s.EnabledMediaKinds = PlaybackMediaKinds.All;
         });
 
@@ -532,7 +564,7 @@
         }
 
         Dislikes.ClearAll();
-        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = PlaylistSource.AllLibrary);
+        await Playback.UpdateSettingsAsync(s => s.EnabledPlaylistSources = PlaylistSourceFilters.None);
         RebuildFilteredItems();
         Toasts.Info($"Cleared {count} dislike{(count == 1 ? "" : "s")} from this library.");
         await OnStatusChanged.InvokeAsync($"Cleared {count} dislike{(count == 1 ? "" : "s")}.");
@@ -548,7 +580,7 @@
         }
 
         SuperLikes.ClearAll();
-        await Playback.UpdateSettingsAsync(s => s.PlaylistSource = PlaylistSource.AllLibrary);
+        await Playback.UpdateSettingsAsync(s => s.EnabledPlaylistSources = PlaylistSourceFilters.None);
         RebuildFilteredItems();
         Toasts.Info($"Cleared {count} super like{(count == 1 ? "" : "s")} from this library.");
         await OnStatusChanged.InvokeAsync($"Cleared {count} super like{(count == 1 ? "" : "s")}.");

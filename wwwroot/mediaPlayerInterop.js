@@ -321,22 +321,31 @@ window.mauiMediaPlayer = {
             }
 
             const layerRect = layer.getBoundingClientRect();
-            slotState.originX = event.clientX - layerRect.left;
-            slotState.originY = event.clientY - layerRect.top;
-
-            if (slotState.scale <= minScale + 0.001) {
-                slotState.anchorClientX = event.clientX;
-                slotState.anchorClientY = event.clientY;
-            }
-
+            const oldScale = slotState.scale;
             const delta = event.deltaY < 0 ? wheelStep : -wheelStep;
-            slotState.scale = Math.min(maxScale, Math.max(minScale, slotState.scale + delta));
+            const newScale = Math.min(maxScale, Math.max(minScale, oldScale + delta));
 
-            if (slotState.scale <= minScale + 0.001) {
+            if (newScale <= minScale + 0.001) {
                 resetPaneZoom(slotIndex, true);
                 return;
             }
 
+            // transform-origin is in the layer's untransformed (local) coordinate space.
+            // getBoundingClientRect() returns the post-scale AABB, so mapping clientX/Y
+            // with (client - rect.left) drifts on successive wheel ticks at the same cursor.
+            if (oldScale <= minScale + 0.001) {
+                slotState.originX = event.clientX - layerRect.left;
+                slotState.originY = event.clientY - layerRect.top;
+                slotState.anchorClientX = event.clientX;
+                slotState.anchorClientY = event.clientY;
+            } else {
+                const ox = slotState.originX;
+                const oy = slotState.originY;
+                slotState.originX = ox + (event.clientX - layerRect.left - ox * oldScale) / oldScale;
+                slotState.originY = oy + (event.clientY - layerRect.top - oy * oldScale) / oldScale;
+            }
+
+            slotState.scale = newScale;
             state.activeSlot = slotIndex;
             applyZoom(slotIndex, layer, slotState);
         };

@@ -19,6 +19,7 @@ public sealed class SettingsService
     private const string SideAdvanceModeKey = "side-advance-mode";
     private const string SharedSideShuffleBagKey = "shared-side-shuffle-bag";
     private const string PlaylistSourceKey = "playlist-source";
+    private const string EnabledPlaylistSourcesKey = "enabled-playlist-sources";
     private const string BoostFavoritesInShuffleKey = "boost-favorites-in-shuffle";
     private const string FavoriteShuffleWeightKey = "favorite-shuffle-weight";
     private const string PenalizeDislikesInShuffleKey = "penalize-dislikes-in-shuffle";
@@ -56,10 +57,7 @@ public sealed class SettingsService
                 ? sideAdvanceMode
                 : SideAdvanceMode.Independent,
             SharedSideShuffleBag = Preferences.Default.Get(SharedSideShuffleBagKey, false),
-            PlaylistSource = Enum.TryParse<PlaylistSource>(Preferences.Default.Get(PlaylistSourceKey, PlaylistSource.AllLibrary.ToString()), out var playlistSource)
-                && Enum.IsDefined(playlistSource)
-                ? playlistSource
-                : PlaylistSource.AllLibrary,
+            EnabledPlaylistSources = LoadEnabledPlaylistSources(),
             BoostFavoritesInShuffle = Preferences.Default.Get(BoostFavoritesInShuffleKey, true),
             FavoriteShuffleWeight = Preferences.Default.Get(FavoriteShuffleWeightKey, PlaybackSettings.DefaultFavoriteShuffleWeight),
             PenalizeDislikesInShuffle = Preferences.Default.Get(PenalizeDislikesInShuffleKey, true),
@@ -77,7 +75,7 @@ public sealed class SettingsService
         settings.Volume = Math.Clamp(settings.Volume, 0, 1);
         settings.LoopMode = Enum.IsDefined(settings.LoopMode) ? settings.LoopMode : LoopMode.All;
         settings.SplitScreenMode = Enum.IsDefined(settings.SplitScreenMode) ? settings.SplitScreenMode : SplitScreenMode.Single;
-        settings.PlaylistSource = Enum.IsDefined(settings.PlaylistSource) ? settings.PlaylistSource : PlaylistSource.AllLibrary;
+        settings.EnabledPlaylistSources = PlaybackSettings.NormalizeEnabledPlaylistSources(settings.EnabledPlaylistSources);
         settings.FavoriteShuffleWeight = Math.Clamp(
             settings.FavoriteShuffleWeight,
             PlaybackSettings.MinFavoriteShuffleWeight,
@@ -110,7 +108,9 @@ public sealed class SettingsService
         Preferences.Default.Set(IsolateVideoToCenterPanelKey, settings.IsolateVideoToCenterPanel);
         Preferences.Default.Set(SideAdvanceModeKey, settings.SideAdvanceMode.ToString());
         Preferences.Default.Set(SharedSideShuffleBagKey, settings.SharedSideShuffleBag);
-        Preferences.Default.Set(PlaylistSourceKey, (Enum.IsDefined(settings.PlaylistSource) ? settings.PlaylistSource : PlaylistSource.AllLibrary).ToString());
+        Preferences.Default.Set(
+            EnabledPlaylistSourcesKey,
+            (int)PlaybackSettings.NormalizeEnabledPlaylistSources(settings.EnabledPlaylistSources));
         Preferences.Default.Set(BoostFavoritesInShuffleKey, settings.BoostFavoritesInShuffle);
         Preferences.Default.Set(
             FavoriteShuffleWeightKey,
@@ -272,6 +272,24 @@ public sealed class SettingsService
             .Where(static path => !IsTransientCachePath(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(10));
+    }
+
+    private static PlaylistSourceFilters LoadEnabledPlaylistSources()
+    {
+        if (Preferences.Default.ContainsKey(EnabledPlaylistSourcesKey))
+        {
+            return PlaybackSettings.NormalizeEnabledPlaylistSources(
+                (PlaylistSourceFilters)Preferences.Default.Get(EnabledPlaylistSourcesKey, (int)PlaylistSourceFilters.None));
+        }
+
+        var legacySource = Enum.TryParse<PlaylistSource>(
+            Preferences.Default.Get(PlaylistSourceKey, PlaylistSource.AllLibrary.ToString()),
+            out var playlistSource)
+            && Enum.IsDefined(playlistSource)
+            ? playlistSource
+            : PlaylistSource.AllLibrary;
+
+        return PlaybackSettings.FromLegacyPlaylistSource(legacySource);
     }
 
     private static bool IsTransientCachePath(string path)

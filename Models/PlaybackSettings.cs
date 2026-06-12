@@ -55,7 +55,23 @@ public sealed class PlaybackSettings
 
     public bool SharedSideShuffleBag { get; set; }
 
-    public PlaylistSource PlaylistSource { get; set; } = PlaylistSource.AllLibrary;
+    public PlaylistSourceFilters EnabledPlaylistSources { get; set; } = PlaylistSourceFilters.None;
+
+    public bool IsAllPlaylistSourcesEnabled => EnabledPlaylistSources == PlaylistSourceFilters.None;
+
+    public bool IsPlaylistSourceFilterEnabled(PlaylistSourceFilters filter) =>
+        !IsAllPlaylistSourcesEnabled && EnabledPlaylistSources.HasFlag(filter);
+
+    public static PlaylistSourceFilters NormalizeEnabledPlaylistSources(PlaylistSourceFilters filters) =>
+        filters & PlaylistSourceFilters.AllFilters;
+
+    public static PlaylistSourceFilters FromLegacyPlaylistSource(PlaylistSource source) => source switch
+    {
+        PlaylistSource.FavoritesOnly => PlaylistSourceFilters.Favorites,
+        PlaylistSource.DislikesOnly => PlaylistSourceFilters.Dislikes,
+        PlaylistSource.SuperLikesOnly => PlaylistSourceFilters.SuperLikes,
+        _ => PlaylistSourceFilters.None,
+    };
 
     public bool BoostFavoritesInShuffle { get; set; } = true;
 
@@ -166,7 +182,7 @@ public sealed class PlaybackSettings
         builder.Append(CultureInfo.InvariantCulture, $"; gifRepeats={GifRepeatCount}");
         builder.Append(CultureInfo.InvariantCulture, $"; loop={LoopMode}");
         builder.Append(CultureInfo.InvariantCulture, $"; shuffle={Shuffle}");
-        builder.Append(CultureInfo.InvariantCulture, $"; playlistSource={PlaylistSource}");
+        builder.Append(CultureInfo.InvariantCulture, $"; enabledPlaylistSources={EnabledPlaylistSources}");
         builder.Append(CultureInfo.InvariantCulture, $"; enabledMediaKinds={EnabledMediaKinds}");
         builder.Append(CultureInfo.InvariantCulture, $"; boostFavorites={BoostFavoritesInShuffle}");
         builder.Append(CultureInfo.InvariantCulture, $"; favoriteWeight={FavoriteShuffleWeight}");
@@ -215,7 +231,7 @@ public sealed class PlaybackSettings
         builder.Append(CultureInfo.InvariantCulture, $",vidIso={(IsVideoIsolationActive ? 1 : 0)}");
         builder.Append(CultureInfo.InvariantCulture, $",sideAdv={SideAdvanceMode}");
         builder.Append(CultureInfo.InvariantCulture, $",sharedSideBag={SharedSideShuffleBag}");
-        builder.Append(CultureInfo.InvariantCulture, $",playlistSrc={PlaylistSource}");
+        builder.Append(CultureInfo.InvariantCulture, $",playlistSrc={EnabledPlaylistSources}");
         return builder.ToString();
     }
 

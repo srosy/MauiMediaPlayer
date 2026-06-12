@@ -623,7 +623,7 @@ public sealed class PlaybackService(
         var previousSpeed = Settings.PlaybackSpeed;
         var previousImageDuration = Settings.ImageDurationSeconds;
         var previousGifRepeats = Settings.GifRepeatCount;
-        var previousPlaylistSource = Settings.PlaylistSource;
+        var previousEnabledPlaylistSources = Settings.EnabledPlaylistSources;
         var previousEnabledMediaKinds = Settings.EnabledMediaKinds;
         var previousBoostFavorites = Settings.BoostFavoritesInShuffle;
         var previousFavoriteWeight = Settings.FavoriteShuffleWeight;
@@ -640,7 +640,7 @@ public sealed class PlaybackService(
         Settings.Volume = Math.Clamp(Settings.Volume, 0, 1);
         Settings.LoopMode = Enum.IsDefined(Settings.LoopMode) ? Settings.LoopMode : LoopMode.All;
         Settings.SplitScreenMode = Enum.IsDefined(Settings.SplitScreenMode) ? Settings.SplitScreenMode : SplitScreenMode.Single;
-        Settings.PlaylistSource = Enum.IsDefined(Settings.PlaylistSource) ? Settings.PlaylistSource : PlaylistSource.AllLibrary;
+        Settings.EnabledPlaylistSources = PlaybackSettings.NormalizeEnabledPlaylistSources(Settings.EnabledPlaylistSources);
         Settings.FavoriteShuffleWeight = Math.Clamp(
             Settings.FavoriteShuffleWeight,
             PlaybackSettings.MinFavoriteShuffleWeight,
@@ -664,7 +664,7 @@ public sealed class PlaybackService(
             ResetSlotIndicesFromCurrent();
             debugLog.Info(Settings.Shuffle ? "Shuffle enabled." : "Shuffle disabled.");
         }
-        else if (Settings.PlaylistSource != previousPlaylistSource
+        else if (Settings.EnabledPlaylistSources != previousEnabledPlaylistSources
             || Settings.EnabledMediaKinds != previousEnabledMediaKinds
             || Settings.BoostFavoritesInShuffle != previousBoostFavorites
             || Math.Abs(Settings.FavoriteShuffleWeight - previousFavoriteWeight) > 0.001
@@ -676,7 +676,7 @@ public sealed class PlaybackService(
             InvalidateShuffleState();
         }
 
-        var playlistEligibilityChanged = Settings.PlaylistSource != previousPlaylistSource
+        var playlistEligibilityChanged = Settings.EnabledPlaylistSources != previousEnabledPlaylistSources
             || Settings.EnabledMediaKinds != previousEnabledMediaKinds;
 
         if (playlistEligibilityChanged)
@@ -745,7 +745,7 @@ public sealed class PlaybackService(
             || Settings.IsolateVideoToCenterPanel != previousIsolateVideo
             || Settings.SideAdvanceMode != previousSideAdvanceMode
             || Settings.SharedSideShuffleBag != previousSharedSideBag
-            || Settings.PlaylistSource != previousPlaylistSource
+            || Settings.EnabledPlaylistSources != previousEnabledPlaylistSources
             || Settings.EnabledMediaKinds != previousEnabledMediaKinds
             || Math.Abs(Settings.PlaybackSpeed - previousSpeed) > 0.001
             || Math.Abs(Settings.ImageDurationSeconds - previousImageDuration) > 0.001
@@ -1990,7 +1990,7 @@ public sealed class PlaybackService(
         }
 
         _slotShuffleQueueInitialized[slotIndex] = true;
-        debugLog.Trace($"Slot {slotIndex + 1} shuffle bag refilled: size={queue.Count}; loopMode={Settings.LoopMode}; playlistSource={Settings.PlaylistSource}.");
+        debugLog.Trace($"Slot {slotIndex + 1} shuffle bag refilled: size={queue.Count}; loopMode={Settings.LoopMode}; enabledPlaylistSources={Settings.EnabledPlaylistSources}.");
     }
 
     // Caller MUST hold _slotStateLock.
@@ -2281,9 +2281,7 @@ public sealed class PlaybackService(
     }
 
     private bool NeedsPlaylistIndexFilter() =>
-        Settings.PlaylistSource is PlaylistSource.FavoritesOnly
-            or PlaylistSource.DislikesOnly
-            or PlaylistSource.SuperLikesOnly
+        !Settings.IsAllPlaylistSourcesEnabled
         || !Settings.IsAllMediaKindsEnabled
         || (dislikesService.Count > 0 && Settings.PenalizeDislikesInShuffle);
 
@@ -2297,9 +2295,12 @@ public sealed class PlaybackService(
         playlistService.RebuildShuffleQueue();
     }
 
+    private bool IsOnlyPlaylistSourceFilter(PlaylistSourceFilters filter) =>
+        !Settings.IsAllPlaylistSourcesEnabled && Settings.EnabledPlaylistSources == filter;
+
     private void NotifyFavoritesOnlyEmptyIfNeeded()
     {
-        if (Settings.PlaylistSource != PlaylistSource.FavoritesOnly || FavoriteCountInPlaylist > 0)
+        if (!IsOnlyPlaylistSourceFilter(PlaylistSourceFilters.Favorites) || FavoriteCountInPlaylist > 0)
         {
             return;
         }
@@ -2315,7 +2316,7 @@ public sealed class PlaybackService(
 
     private void NotifyDislikesOnlyEmptyIfNeeded()
     {
-        if (Settings.PlaylistSource != PlaylistSource.DislikesOnly || DislikeCountInPlaylist > 0)
+        if (!IsOnlyPlaylistSourceFilter(PlaylistSourceFilters.Dislikes) || DislikeCountInPlaylist > 0)
         {
             return;
         }
@@ -2331,7 +2332,7 @@ public sealed class PlaybackService(
 
     private void NotifySuperLikesOnlyEmptyIfNeeded()
     {
-        if (Settings.PlaylistSource != PlaylistSource.SuperLikesOnly || SuperLikeCountInPlaylist > 0)
+        if (!IsOnlyPlaylistSourceFilter(PlaylistSourceFilters.SuperLikes) || SuperLikeCountInPlaylist > 0)
         {
             return;
         }
@@ -2406,19 +2407,17 @@ public sealed class PlaybackService(
             return false;
         }
 
-        if (Settings.PlaylistSource == PlaylistSource.FavoritesOnly)
+        if (!Settings.IsAllPlaylistSourcesEnabled)
         {
-            return favoritesService.IsFavorite(items[index].FilePath);
-        }
+            var filters = Settings.EnabledPlaylistSources;
+            var path = items[index].FilePath;
 
-        if (Settings.PlaylistSource == PlaylistSource.DislikesOnly)
-        {
-            return dislikesService.IsDisliked(items[index].FilePath);
-        }
-
-        if (Settings.PlaylistSource == PlaylistSource.SuperLikesOnly)
-        {
-            return superLikesService.IsSuperLiked(items[index].FilePath);
+            if (!((filters.HasFlag(PlaylistSourceFilters.Favorites) && favoritesService.IsFavorite(path))
+                || (filters.HasFlag(PlaylistSourceFilters.Dislikes) && dislikesService.IsDisliked(path))
+                || (filters.HasFlag(PlaylistSourceFilters.SuperLikes) && superLikesService.IsSuperLiked(path))))
+            {
+                return false;
+            }
         }
 
         if (IsDislikedIndexFullySuppressed(index))
@@ -2434,6 +2433,14 @@ public sealed class PlaybackService(
         var items = playlistService.Items;
 
         if (index < 0 || index >= items.Count)
+        {
+            return false;
+        }
+
+        // Dislike shuffle suppression applies only when browsing the full library.
+        // Explicit source filters (Dislikes-only, Favorites-only, etc.) must not hide
+        // items that already passed the source filter above.
+        if (!Settings.IsAllPlaylistSourcesEnabled)
         {
             return false;
         }
@@ -2454,10 +2461,15 @@ public sealed class PlaybackService(
 
         if (dislikesService.IsDisliked(items[index].FilePath))
         {
+            if (!Settings.IsAllPlaylistSourcesEnabled)
+            {
+                return 1;
+            }
+
             return Settings.GetDislikedShuffleCopyCount();
         }
 
-        if (Settings.PlaylistSource == PlaylistSource.AllLibrary
+        if (Settings.IsAllPlaylistSourcesEnabled
             && Settings.Shuffle
             && Settings.BoostSuperLikesInShuffle
             && superLikesService.IsSuperLiked(items[index].FilePath))
@@ -2465,7 +2477,7 @@ public sealed class PlaybackService(
             return Math.Max(1, (int)Math.Round(Settings.SuperLikeShuffleWeight));
         }
 
-        if (Settings.PlaylistSource == PlaylistSource.AllLibrary
+        if (Settings.IsAllPlaylistSourcesEnabled
             && Settings.Shuffle
             && Settings.BoostFavoritesInShuffle
             && favoritesService.IsFavorite(items[index].FilePath))

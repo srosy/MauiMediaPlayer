@@ -320,7 +320,7 @@
         Playback.UpdateSettingsAsync(s => s.RecursiveFolderScan = args.Value is bool enabled && enabled);
 
     private bool CanBoostFavoritesInShuffle =>
-        Playback.Settings.PlaylistSource == PlaylistSource.AllLibrary
+        Playback.Settings.IsAllPlaylistSourcesEnabled
         && Playback.Settings.Shuffle;
 
     private bool CanAdjustFavoriteWeight =>
